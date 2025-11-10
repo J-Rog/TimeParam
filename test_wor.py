@@ -1,9 +1,12 @@
 import carla
+import csv
 import os
 import random
 import sys
 import time
 import math
+from datetime import datetime
+from itertools import product
 from types import SimpleNamespace
 import argparse
 import numpy as np
@@ -47,6 +50,8 @@ except ModuleNotFoundError as exc:
         "Ensure the leaderboard + scenario_runner folders exist in this workspace "
         "and CARLA_ROOT/PythonAPI/carla is accessible."
     ) from exc
+
+DEFAULT_TM_PORT = 8000
 
 
 class _CriterionBucket:
@@ -172,9 +177,11 @@ class LeaderboardLikeScorer:
             'pedestrian': 0,
             'static': 0,
         }
+        self._collision_block_active = False
         self._red_light_events = 0
         self._last_red_light_id = None
         self._collision_last_frames = {}
+        self._collision_unique_keys = set()
 
         self._wallclock_start = time.time()
         self.sim_time = 0.0
@@ -187,6 +194,26 @@ class LeaderboardLikeScorer:
         if last_frame >= 0 and frame - last_frame < self.COLLISION_COOLDOWN_FRAMES:
             return
         self._collision_last_frames[key] = frame
+
+        unique_key = key
+        if other is None:
+            actor_loc = None
+            if hasattr(event, 'actor') and event.actor:
+                try:
+                    actor_loc = event.actor.get_transform().location
+                except RuntimeError:
+                    actor_loc = None
+            if actor_loc:
+                unique_key = (
+                    'static',
+                    round(actor_loc.x, 1),
+                    round(actor_loc.y, 1),
+                    round(actor_loc.z, 1),
+                )
+        if unique_key in self._collision_unique_keys:
+            return
+        self._collision_unique_keys.add(unique_key)
+        self._collision_block_active = True
 
         if other and 'walker.' in other.type_id:
             event_type = TrafficEventType.COLLISION_PEDESTRIAN
@@ -274,6 +301,13 @@ class LeaderboardLikeScorer:
 
     def get_red_light_events(self):
         return self._red_light_events
+
+    def collision_block_active(self):
+        return self._collision_block_active
+
+    def clear_collision_block_if_recovered(self, speed_ms, recovery_speed=1.0):
+        if self._collision_block_active and speed_ms > recovery_speed:
+            self._collision_block_active = False
 
     def _check_red_light(self, vehicle, frame):
         light = vehicle.get_traffic_light()
@@ -476,7 +510,107 @@ def parse_args():
         action="store_true",
         help="Print GNSS readings vs. route GPS (converted from x,y,z) to debug mismatches.",
     )
+    parser.add_argument(
+        "--control-period",
+        type=float,
+        default=0.05,
+        help="Control command period in seconds.",
+    )
+    parser.add_argument(
+        "--vehicle-density",
+        type=int,
+        default=20,
+        help="Number of TrafficManager vehicles to keep active (density proxy).",
+    )
+    parser.add_argument(
+        "--pedestrian-density",
+        type=int,
+        default=50,
+        help="Number of pedestrians to spawn (density proxy).",
+    )
+    parser.add_argument(
+        "--sweep-control-periods",
+        type=float,
+        nargs="+",
+        help="If set, run once for each listed control period (seconds).",
+    )
+    parser.add_argument(
+        "--sweep-vehicle-density",
+        type=int,
+        nargs="+",
+        help="Vehicle density values to sweep (overrides --vehicle-density).",
+    )
+    parser.add_argument(
+        "--sweep-pedestrian-density",
+        type=int,
+        nargs="+",
+        help="Pedestrian density values to sweep (overrides --pedestrian-density).",
+    )
+    parser.add_argument(
+        "--sweep-log",
+        type=str,
+        help="Optional CSV path for logging sweep results (rows appended).",
+    )
+    parser.add_argument(
+        "--reload-world-between-runs",
+        action="store_true",
+        help="Reload the CARLA world before each sweep run instead of reusing the previous one.",
+    )
     return parser.parse_args()
+
+
+class SweepLogger:
+    """CSV helper that appends sweep rows when a file path is provided."""
+
+    FIELDNAMES = [
+        "timestamp",
+        "route_id",
+        "route_xml",
+        "agent",
+        "control_period",
+        "effective_control_period",
+        "control_steps",
+        "vehicle_density",
+        "pedestrian_density",
+        "status",
+        "route_completion",
+        "sim_time",
+        "wall_time",
+        "lane_crossings",
+        "collisions_vehicle",
+        "collisions_pedestrian",
+        "collisions_static",
+        "red_lights",
+        "message",
+    ]
+
+    def __init__(self, csv_path):
+        self._path = csv_path
+        self._file = None
+        self._writer = None
+        if not csv_path:
+            return
+        directory = os.path.dirname(csv_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        file_exists = os.path.isfile(csv_path)
+        self._file = open(csv_path, "a", newline="")
+        self._writer = csv.DictWriter(self._file, fieldnames=self.FIELDNAMES)
+        if not file_exists or os.path.getsize(csv_path) == 0:
+            self._writer.writeheader()
+
+    def log(self, row):
+        if not self._writer:
+            return
+        sanitized = {key: row.get(key) for key in self.FIELDNAMES}
+        self._writer.writerow(sanitized)
+        self._file.flush()
+
+    def close(self):
+        if self._file:
+            self._file.close()
+            self._file = None
+            self._writer = None
 
 # ---------- helpers ----------
 
@@ -605,7 +739,9 @@ def spawn_walkers(client, world, n_walkers=80, seed=42):
 def destroy(actors):
     try:
         for a in actors:
-            if a.is_alive:
+            if not a:
+                continue
+            if getattr(a, 'is_alive', False):
                 a.destroy()
     except RuntimeError:
         pass
@@ -620,37 +756,65 @@ def draw_route_debug(world, dense_route, step=5):
         world.debug.draw_point(loc, size=0.1, color=color, life_time=0.0, persistent_lines=True)
 
 
+def destroy_sensors(sensors):
+    for sensor in sensors:
+        if not sensor:
+            continue
+        try:
+            stop_fn = getattr(sensor, 'stop', None)
+            if callable(stop_fn):
+                stop_fn()
+        except RuntimeError:
+            pass
+        try:
+            destroy_fn = getattr(sensor, 'destroy', None)
+            if callable(destroy_fn):
+                destroy_fn()
+        except RuntimeError:
+            pass
+
+
+def _load_world_and_wait(client, town):
+    client.load_world(town)
+    world = client.get_world()
+    try:
+        world.wait_for_tick()
+    except RuntimeError:
+        time.sleep(0.5)
+    return world
+
+
+def _apply_route_weather(world, route_config):
+    weather = getattr(route_config, 'weather', None)
+    if weather is None:
+        return
+    try:
+        world.set_weather(weather)
+    except RuntimeError as exc:
+        print(f"Failed to apply route weather ({exc}); continuing with current weather settings.")
+
+
 # ---------- main ----------
 
-def main():
-    args = parse_args()
-    route_xml = os.path.abspath(args.route)
-    if not os.path.isfile(route_xml):
-        raise FileNotFoundError(f"Route file {route_xml} not found")
+def run_configuration(args, client, world, tm_port, route_xml, preview_config,
+                      control_period, vehicle_density, pedestrian_density):
+    if control_period <= 0:
+        raise ValueError("Control period must be positive")
 
-    scenario_json = os.path.join(CURRENT_DIR, "leaderboard_codes", "no_scenarios.json")
-    preview_indexer = LegacyRouteIndexer(route_xml, scenario_json, 1)
-    preview_config = preview_indexer.next()
-    if not preview_config or not getattr(preview_config, "trajectory", None):
-        raise RuntimeError(f"Route file {route_xml} does not contain any waypoints")
-
-    route_town = args.town or getattr(preview_config, "town", None)
-    if not route_town or route_town == "_":
-        raise RuntimeError("Route file does not specify a town. Use --town to select the CARLA map.")
-
-    client = carla.Client('localhost', 2000)
-    client.set_timeout(10.0)
-
-    TM_PORT = 8000
     FIXED_DT = 0.05
     STUCK_SPEED_THRESHOLD = 0.2  # m/s
     STUCK_TIME_SECONDS = 8.0
-    CONTROL_PERIOD = 0.05
-    CONTROL_STEPS = max(1, int(round(CONTROL_PERIOD / FIXED_DT)))
 
-    client.load_world(route_town)
-    world = client.get_world()
-    tm = client.get_trafficmanager(TM_PORT)
+    _apply_route_weather(world, preview_config)
+    tm = client.get_trafficmanager(tm_port)
+
+    control_steps = max(1, int(round(control_period / FIXED_DT)))
+    effective_control_period = control_steps * FIXED_DT
+    if abs(effective_control_period - control_period) > 1e-6:
+        print(
+            f"Requested control period {control_period:.3f}s rounded to "
+            f"{effective_control_period:.3f}s (steps={control_steps})."
+        )
 
     dense_route_preview = interpolate_trajectory(world, preview_config.trajectory)[1]
     lat_ref, lon_ref = _get_latlon_ref(world)
@@ -661,7 +825,7 @@ def main():
     if args.draw_route:
         draw_route_debug(world, dense_route_preview)
 
-    prev_settings = make_sync(world, tm, fixed_dt=FIXED_DT)
+    make_sync(world, tm, fixed_dt=FIXED_DT)
 
     bp_lib = world.get_blueprint_library()
     ego_bp = bp_lib.filter('vehicle.tesla.model3')[0]
@@ -693,14 +857,14 @@ def main():
         cam_rot = carla.Rotation(pitch=-12.0, yaw=tf.rotation.yaw)
         spectator.set_transform(carla.Transform(cam_loc, cam_rot))
 
-    def vehicle_overlay_lines(ego, control, route_tracker, route_transforms, red_count):
+    def vehicle_overlay_lines(ego_actor, control, route_tracker, route_transforms, red_count):
         lines = []
-        spd_ms = ego.get_velocity().length()
+        spd_ms = ego_actor.get_velocity().length()
         lines.append(
             f"Speed {spd_ms*3.6:5.1f} km/h | steer {control.steer:+.2f} "
             f"thr {control.throttle:.2f} brk {control.brake:.2f}"
         )
-        tf = ego.get_transform()
+        tf = ego_actor.get_transform()
         lines.append(
             f"Pos ({tf.location.x:7.1f}, {tf.location.y:7.1f}, {tf.location.z:5.1f}) "
             f"Yaw {tf.rotation.yaw:6.1f}"
@@ -724,76 +888,88 @@ def main():
 
     world.tick()
 
-    vehicles = spawn_tm_vehicles(client, world, TM_PORT, n_vehicles=20, seed=42)
-    walkers, walker_controllers = spawn_walkers(client, world, n_walkers=50, seed=42)
-
-    agent_name = args.agent
-    pcla = PCLA(agent_name, ego, route_xml, client)
-    scorer = LeaderboardLikeScorer(world, route_xml)
-    hud = OverlayHUD()
-
+    vehicles = []
+    walkers = []
+    walker_controllers = []
     aux_sensors = []
-    collision_bp = bp_lib.find('sensor.other.collision')
-    collision_sensor = world.spawn_actor(collision_bp, carla.Transform(), attach_to=ego)
-    collision_sensor.listen(scorer.on_collision)
-    aux_sensors.append(collision_sensor)
+    hud = OverlayHUD()
+    pcla = None
+    scorer = None
+    status = 'aborted'
+    message = 'manual_stop'
 
-    lane_bp = bp_lib.find('sensor.other.lane_invasion')
-    lane_sensor = world.spawn_actor(lane_bp, carla.Transform(), attach_to=ego)
-    lane_sensor.listen(scorer.on_lane_invasion)
-    aux_sensors.append(lane_sensor)
-
-    latest_gnss = {'lat': None, 'lon': None, 'alt': None}
-    if args.debug_gps:
-        gnss_bp = bp_lib.find('sensor.other.gnss')
-        gnss_bp.set_attribute('sensor_tick', f"{FIXED_DT}")
-        gnss_sensor = world.spawn_actor(gnss_bp, carla.Transform(), attach_to=ego)
-
-        def _debug_gnss_cb(measurement):
-            latest_gnss['lat'] = measurement.latitude
-            latest_gnss['lon'] = measurement.longitude
-            latest_gnss['alt'] = measurement.altitude
-
-        gnss_sensor.listen(_debug_gnss_cb)
-        aux_sensors.append(gnss_sensor)
-
-    print(f"Spawned ego and {len(vehicles)} vehicles, {len(walkers)} walkers.")
-
-    score_record = None
-    stuck_frames = 0
-    steps_since_action = CONTROL_STEPS
-    pending_control = carla.VehicleControl()
     try:
-        while True:
-            if steps_since_action >= CONTROL_STEPS:
-                pending_control = pcla.get_action()
-                steps_since_action = 0
-            ego.apply_control(pending_control)
-            steps_since_action += 1
-            follow(ego)
+        vehicles = spawn_tm_vehicles(client, world, tm_port, n_vehicles=vehicle_density, seed=42)
+        walkers, walker_controllers = spawn_walkers(client, world, n_walkers=pedestrian_density, seed=42)
 
+        agent_name = args.agent
+        pcla = PCLA(agent_name, ego, route_xml, client)
+        scorer = LeaderboardLikeScorer(world, route_xml)
+
+        collision_bp = bp_lib.find('sensor.other.collision')
+        collision_sensor = world.spawn_actor(collision_bp, carla.Transform(), attach_to=ego)
+        collision_sensor.listen(scorer.on_collision)
+        aux_sensors.append(collision_sensor)
+
+        lane_bp = bp_lib.find('sensor.other.lane_invasion')
+        lane_sensor = world.spawn_actor(lane_bp, carla.Transform(), attach_to=ego)
+        lane_sensor.listen(scorer.on_lane_invasion)
+        aux_sensors.append(lane_sensor)
+
+        latest_gnss = {'lat': None, 'lon': None, 'alt': None}
+        if args.debug_gps:
+            gnss_bp = bp_lib.find('sensor.other.gnss')
+            gnss_bp.set_attribute('sensor_tick', f"{FIXED_DT}")
+            gnss_sensor = world.spawn_actor(gnss_bp, carla.Transform(), attach_to=ego)
+
+            def _debug_gnss_cb(measurement):
+                latest_gnss['lat'] = measurement.latitude
+                latest_gnss['lon'] = measurement.longitude
+                latest_gnss['alt'] = measurement.altitude
+
+            gnss_sensor.listen(_debug_gnss_cb)
+            aux_sensors.append(gnss_sensor)
+
+        print(
+            f"Spawned ego and {len(vehicles)} vehicles, {len(walkers)} walkers "
+            f"(targets {vehicle_density}/{pedestrian_density})."
+        )
+
+        stuck_frames = 0
+        steps_since_action = control_steps
+        pending_control = carla.VehicleControl()
+        terminal_message = ""
+
+        while True:
             world.tick()
             monitor = getattr(world, "_tm_monitor", None)
             if monitor:
                 monitor()
             snapshot = world.get_snapshot()
-            frame = snapshot.frame if snapshot else scorer._frame
+            frame = snapshot.frame if snapshot else 0
             scorer.tick(ego, FIXED_DT, frame)
+            follow(ego)
+
             spd_ms = ego.get_velocity().length()
+            scorer.clear_collision_block_if_recovered(spd_ms)
             if (
                 spd_ms < STUCK_SPEED_THRESHOLD
-                and pending_control.throttle > 0.3
-                and pending_control.brake < 0.1
+                and (
+                    (pending_control.throttle > 0.3 and pending_control.brake < 0.1)
+                    or scorer.collision_block_active()
+                )
             ):
                 stuck_frames += 1
             else:
                 stuck_frames = 0
             if stuck_frames * FIXED_DT >= STUCK_TIME_SECONDS:
+                terminal_message = "vehicle_stuck"
                 print(
                     f"Aborting run: vehicle stuck (speed {spd_ms:.2f} m/s for "
                     f"{stuck_frames * FIXED_DT:.1f}s)."
                 )
                 break
+
             overlay_lines = scorer.get_overlay_lines()
             overlay_lines.extend(
                 vehicle_overlay_lines(
@@ -806,12 +982,12 @@ def main():
             )
             hud.update(overlay_lines)
 
-            # Abort if we drift too far from the next waypoint (missed turn)
             if scorer.route_tracker.transforms:
                 idx = min(scorer.route_tracker.current_index, len(dense_route_preview) - 1)
                 next_loc = dense_route_preview[idx][0].location
                 distance_to_wp = ego.get_transform().location.distance(next_loc)
                 if distance_to_wp > 10.0:
+                    terminal_message = "route_deviation"
                     print(
                         f"Aborting run: distance to next waypoint exceeded 10m "
                         f"(current {distance_to_wp:.2f} m at index {idx})."
@@ -819,6 +995,7 @@ def main():
                     break
 
             if scorer.completed_event_sent:
+                terminal_message = "route_completed"
                 sim_t, wall_t = scorer.elapsed_times()
                 print(f"Route completed in {sim_t:.1f}s (sim) / {wall_t:.1f}s (wall).")
                 break
@@ -848,24 +1025,42 @@ def main():
                 )
 
             if random.random() < 0.02:
-                for c in walker_controllers:
-                    c.go_to_location(world.get_random_location_from_navigation())
+                for controller in walker_controllers:
+                    controller.go_to_location(world.get_random_location_from_navigation())
+
+            if steps_since_action >= control_steps:
+                pending_control = pcla.get_action()
+                steps_since_action = 0
+            ego.apply_control(pending_control)
+            steps_since_action += 1
+
+        status = "completed" if scorer.completed_event_sent else "aborted"
+        message = terminal_message or ("route_completed" if status == "completed" else "manual_stop")
 
     except KeyboardInterrupt:
-        pass
+        message = "keyboard_interrupt"
+        raise
     finally:
-        for c in walker_controllers:
+        for controller in walker_controllers:
             try:
-                c.stop()
+                controller.stop()
             except RuntimeError:
                 pass
 
-        pcla.cleanup()
-        destroy([ego])
+        destroy_sensors(aux_sensors)
+        aux_sensors.clear()
+
+        if pcla is not None:
+            try:
+                pcla.cleanup()
+            except Exception:
+                pass
+
+        if ego is not None:
+            destroy([ego])
         destroy(vehicles)
         destroy(walkers)
         destroy(walker_controllers)
-        destroy(aux_sensors)
 
         settings = world.get_settings()
         settings.synchronous_mode = False
@@ -875,22 +1070,179 @@ def main():
 
         hud.close()
 
-        try:
-            scorer.finalize()
-        except Exception as exc:
-            print(f"Failed to compute leaderboard-like stats: {exc}")
-        sim_time, wall_time = scorer.elapsed_times()
-        collisions = scorer.get_collision_counts()
-        lane_crossings = scorer.get_lane_crossings()
-        red_lights = scorer.get_red_light_events()
-        print(
-            f"Run summary -> sim_time {sim_time:.1f}s, wall_time {wall_time:.1f}s, "
-            f"lane_crossings {lane_crossings}, "
-            f"collisions v/p/s {collisions['vehicle']}/{collisions['pedestrian']}/{collisions['static']} "
-            f"red_lights {red_lights} | route_completion {scorer.route_percent:.1f}%"
-        )
+        if scorer is not None:
+            try:
+                scorer.finalize()
+            except Exception as exc:
+                print(f"Failed to compute leaderboard-like stats: {exc}")
 
-        print("Done.")
+    if scorer is None:
+        raise RuntimeError("Leaderboard scorer did not initialize; run aborted before start")
+
+    sim_time, wall_time = scorer.elapsed_times()
+    collisions = scorer.get_collision_counts()
+    lane_crossings = scorer.get_lane_crossings()
+    red_lights = scorer.get_red_light_events()
+    print(
+        f"Run summary -> sim_time {sim_time:.1f}s, wall_time {wall_time:.1f}s, "
+        f"lane_crossings {lane_crossings}, "
+        f"collisions v/p/s {collisions['vehicle']}/{collisions['pedestrian']}/{collisions['static']} "
+        f"red_lights {red_lights} | route_completion {scorer.route_percent:.1f}% | status {status}"
+    )
+
+    return {
+        'timestamp': datetime.utcnow().isoformat(),
+        'route_id': scorer.route_id,
+        'route_xml': route_xml,
+        'agent': args.agent,
+        'control_period': float(control_period),
+        'effective_control_period': float(effective_control_period),
+        'control_steps': control_steps,
+        'vehicle_density': vehicle_density,
+        'pedestrian_density': pedestrian_density,
+        'status': status,
+        'route_completion': scorer.route_percent,
+        'sim_time': sim_time,
+        'wall_time': wall_time,
+        'lane_crossings': lane_crossings,
+        'collisions_vehicle': collisions['vehicle'],
+        'collisions_pedestrian': collisions['pedestrian'],
+        'collisions_static': collisions['static'],
+        'red_lights': red_lights,
+        'message': message,
+    }
+
+
+def _route_id_from_config(route_config):
+    name = getattr(route_config, "name", "route") or "route"
+    repetition = getattr(route_config, "repetition_index", 0)
+    return f"{name}_rep{repetition}"
+
+
+def main():
+    args = parse_args()
+    route_xml = os.path.abspath(args.route)
+    if not os.path.isfile(route_xml):
+        raise FileNotFoundError(f"Route file {route_xml} not found")
+
+    scenario_json = os.path.join(CURRENT_DIR, "leaderboard_codes", "no_scenarios.json")
+    preview_indexer = LegacyRouteIndexer(route_xml, scenario_json, 1)
+    preview_config = preview_indexer.next()
+    if not preview_config or not getattr(preview_config, "trajectory", None):
+        raise RuntimeError(f"Route file {route_xml} does not contain any waypoints")
+
+    route_town = args.town or getattr(preview_config, "town", None)
+    if not route_town or route_town == "_":
+        raise RuntimeError("Route file does not specify a town. Use --town to select the CARLA map.")
+
+    client = carla.Client('localhost', 2000)
+    client.set_timeout(10.0)
+    tm_port = DEFAULT_TM_PORT
+
+    control_periods = args.sweep_control_periods or [args.control_period]
+    vehicle_counts = args.sweep_vehicle_density or [args.vehicle_density]
+    pedestrian_counts = args.sweep_pedestrian_density or [args.pedestrian_density]
+
+    def _build_density_pairs(vehicles, pedestrians):
+        vehicle_sweep = bool(args.sweep_vehicle_density)
+        pedestrian_sweep = bool(args.sweep_pedestrian_density)
+        if vehicle_sweep and pedestrian_sweep:
+            if len(vehicles) != len(pedestrians):
+                raise ValueError(
+                    "--sweep-vehicle-density and --sweep-pedestrian-density must have the same length "
+                    "when both are provided."
+                )
+            return list(zip(vehicles, pedestrians))
+        if vehicle_sweep:
+            return [(vehicle, pedestrians[0]) for vehicle in vehicles]
+        if pedestrian_sweep:
+            return [(vehicles[0], ped) for ped in pedestrians]
+        return [(vehicles[0], pedestrians[0])]
+
+    density_pairs = _build_density_pairs(vehicle_counts, pedestrian_counts)
+    combos = [
+        (cp, veh_count, ped_count)
+        for cp, (veh_count, ped_count) in product(control_periods, density_pairs)
+    ]
+
+    print(
+        f"Preparing {len(combos)} configuration{'s' if len(combos) != 1 else ''} "
+        f"(control_periods={control_periods}, density_pairs={density_pairs})."
+    )
+
+    sweep_logger = SweepLogger(args.sweep_log)
+    route_fallback_id = _route_id_from_config(preview_config)
+    world = _load_world_and_wait(client, route_town)
+
+    try:
+        for idx, (control_period, vehicle_count, pedestrian_count) in enumerate(combos, start=1):
+            print(
+                f"\n=== Run {idx}/{len(combos)}: control_period={control_period:.3f}s | "
+                f"vehicles={vehicle_count} | pedestrians={pedestrian_count} ==="
+            )
+
+            if idx == 1:
+                current_world = world
+            else:
+                if args.reload_world_between_runs:
+                    current_world = _load_world_and_wait(client, route_town)
+                else:
+                    current_world = client.get_world()
+                    try:
+                        current_world.wait_for_tick()
+                    except RuntimeError:
+                        time.sleep(0.1)
+
+            try:
+                result = run_configuration(
+                    args,
+                    client,
+                    current_world,
+                    tm_port,
+                    route_xml,
+                    preview_config,
+                    control_period,
+                    vehicle_count,
+                    pedestrian_count,
+                )
+            except KeyboardInterrupt:
+                print("Sweep interrupted by user. Exiting...")
+                raise
+            except Exception as exc:
+                print(f"Configuration failed: {exc}")
+                if not args.reload_world_between_runs:
+                    try:
+                        world = _load_world_and_wait(client, route_town)
+                    except Exception as reload_exc:
+                        print(f"Failed to reload world after error: {reload_exc}")
+                sweep_logger.log({
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'route_id': route_fallback_id,
+                    'route_xml': route_xml,
+                    'agent': args.agent,
+                    'control_period': float(control_period),
+                    'effective_control_period': None,
+                    'control_steps': None,
+                    'vehicle_density': vehicle_count,
+                    'pedestrian_density': pedestrian_count,
+                    'status': 'error',
+                    'route_completion': None,
+                    'sim_time': None,
+                    'wall_time': None,
+                    'lane_crossings': None,
+                    'collisions_vehicle': None,
+                    'collisions_pedestrian': None,
+                    'collisions_static': None,
+                    'red_lights': None,
+                    'message': str(exc),
+                })
+                continue
+
+            sweep_logger.log(result)
+            world = current_world
+    finally:
+        sweep_logger.close()
+
 
 if __name__ == "__main__":
     main()

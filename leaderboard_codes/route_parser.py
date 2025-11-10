@@ -63,7 +63,7 @@ class RouteParser(object):
             new_config = RouteScenarioConfiguration()
             new_config.town = route.attrib['town']
             new_config.name = "RouteScenario_{}".format(route_id)
-            #new_config.weather = RouteParser.parse_weather(route)
+            new_config.weather = RouteParser.parse_weather(route)
             new_config.scenario_file = scenario_file
 
             waypoint_list = []  # the list of waypoints that can be found on this route
@@ -77,6 +77,31 @@ class RouteParser(object):
             list_route_descriptions.append(new_config)
 
         return list_route_descriptions
+
+    @staticmethod
+    def parse_weather(route):
+        """Extract CARLA weather parameters from a <weather> node if present."""
+        route_weather = route.find("weather")
+        if route_weather is None:
+            return carla.WeatherParameters(sun_altitude_angle=70.0, cloudiness=30.0)
+
+        weather = carla.WeatherParameters()
+        attr_map = {
+            'cloudiness': 'cloudiness',
+            'precipitation': 'precipitation',
+            'precipitation_deposits': 'precipitation_deposits',
+            'wind_intensity': 'wind_intensity',
+            'sun_azimuth_angle': 'sun_azimuth_angle',
+            'sun_altitude_angle': 'sun_altitude_angle',
+            'wetness': 'wetness',
+            'fog_distance': 'fog_distance',
+            'fog_density': 'fog_density',
+            'fog_falloff': 'fog_falloff',
+        }
+        for xml_attr, weather_attr in attr_map.items():
+            if xml_attr in route_weather.attrib and hasattr(weather, weather_attr):
+                setattr(weather, weather_attr, float(route_weather.attrib[xml_attr]))
+        return weather
 '''
     @staticmethod
     def parse_weather(route):

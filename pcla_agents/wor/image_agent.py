@@ -83,8 +83,9 @@ class ImageAgent(AutonomousAgent):
         )
         if needs_resaware:
             convert_bn_to_resaware(self.image_model)
-
-        self.image_model.load_state_dict(checkpoint_state)
+            self.image_model.load_state_dict(checkpoint_state, strict=False)
+        else:
+            self.image_model.load_state_dict(checkpoint_state)
         self.supported_resolutions = checkpoint_meta.get('resolution_scales') or []
         if self.supported_resolutions:
             print(f"Loaded res-aware checkpoint supporting scales: {self.supported_resolutions}")

@@ -575,25 +575,17 @@ def main():
     )
 
     model = CameraModel(cfg).to(device)
+    convert_bn_to_resaware(model)
     student_state_dict, _ = _load_checkpoint(CHECKPOINT_PATH, device)
-    if state_dict_has_resaware_stats(student_state_dict):
-        convert_bn_to_resaware(model)
-        model.load_state_dict(student_state_dict)
-    else:
-        model.load_state_dict(student_state_dict)
-        convert_bn_to_resaware(model)
+    model.load_state_dict(student_state_dict, strict=False)
     model.train()
 
     teacher_model = None
     if TEACHER_KL_WEIGHT > 0 or TEACHER_FEAT_WEIGHT > 0:
         teacher_model = CameraModel(cfg).to(device)
+        convert_bn_to_resaware(teacher_model)
         teacher_state_dict, _ = _load_checkpoint(TEACHER_CHECKPOINT, device)
-        if state_dict_has_resaware_stats(teacher_state_dict):
-            convert_bn_to_resaware(teacher_model)
-            teacher_model.load_state_dict(teacher_state_dict)
-        else:
-            teacher_model.load_state_dict(teacher_state_dict)
-            convert_bn_to_resaware(teacher_model)
+        teacher_model.load_state_dict(teacher_state_dict, strict=False)
         teacher_model.eval()
         for param in teacher_model.parameters():
             param.requires_grad = False

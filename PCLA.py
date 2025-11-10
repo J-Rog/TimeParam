@@ -42,6 +42,7 @@ class PCLA():
         self.agent_instance = None
         self.routePath = None
         self._watchdog = None
+        self._managed_sensors = []
         self.set(agent, vehicle, route, client)
     
     def set(self, agent, vehicle, route, client):
@@ -82,6 +83,7 @@ class PCLA():
         Create the sensors defined by the user and attach them to the ego-vehicle
         """
         bp_library = self.world.get_blueprint_library()
+        self._managed_sensors = []
         for sensor_spec in self.agent_instance.sensors():
             # These are the pseudosensors (not spawned)
             if sensor_spec['type'].startswith('sensor.opendrive_map'):
@@ -106,6 +108,7 @@ class PCLA():
                 sensor = self.world.spawn_actor(bp_setup, sensor_transform, self.vehicle)
             # setup callback
             sensor.listen(CallBack(sensor_spec['id'], sensor_spec['type'], sensor, self.agent_instance.sensor_interface))
+            self._managed_sensors.append(sensor)
 
         # Tick once to spawn the sensors
         self.world.tick()
@@ -137,12 +140,21 @@ class PCLA():
             print("\n\033[91mFailed to stop the agent:")
             print(f"\n{traceback.format_exc()}\033[0m")
 
-        # Make sure no sensors are left streaming
-        alive_sensors = self.world.get_actors().filter('*sensor*')
-        for sensor in alive_sensors:
-            if sensor.is_listening():
-                sensor.stop()
-            sensor.destroy()
+        # Make sure the sensors we spawned are stopped and destroyed
+        for sensor in self._managed_sensors:
+            try:
+                stop_fn = getattr(sensor, 'stop', None)
+                if stop_fn:
+                    stop_fn()
+            except RuntimeError:
+                pass
+            try:
+                destroy_fn = getattr(sensor, 'destroy', None)
+                if destroy_fn:
+                    destroy_fn()
+            except RuntimeError:
+                pass
+        self._managed_sensors = []
 
         # Destroy vehicle after sensors are cleaned up
         try:
