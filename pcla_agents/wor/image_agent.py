@@ -8,13 +8,19 @@ import wandb
 import carla
 import random
 import string
+import cv2
 
 from torch.distributions.categorical import Categorical
 
 from leaderboard_codes.autonomous_agent1 import AutonomousAgent, Track
 from utils import visualize_obs
 
-from rails.models import EgoModel, CameraModel
+from rails.models import (
+    EgoModel,
+    CameraModel,
+    convert_bn_to_resaware,
+    state_dict_has_resaware_stats,
+)
 from waypointer import Waypointer
 
 def get_entry_point():
@@ -57,9 +63,33 @@ class ImageAgent(AutonomousAgent):
                 setattr(self, key, value)
 
         self.device = torch.device('cuda')
+        self.sensor_tick = getattr(self, 'sensor_tick', 0.05)
+        self.wide_scale = getattr(self, 'wide_scale', 1.0)
+        self.narr_scale = getattr(self, 'narr_scale', 1.0)
 
         self.image_model = CameraModel(config).to(self.device)
-        self.image_model.load_state_dict(torch.load(self.main_model_dir))
+        checkpoint_payload = torch.load(self.main_model_dir, map_location=self.device)
+        checkpoint_meta = {}
+        if isinstance(checkpoint_payload, dict) and 'state_dict' in checkpoint_payload:
+            checkpoint_state = checkpoint_payload['state_dict']
+            checkpoint_meta = {k: v for k, v in checkpoint_payload.items() if k != 'state_dict'}
+        else:
+            checkpoint_state = checkpoint_payload
+
+        needs_resaware = (
+            checkpoint_meta.get('resaware_bn')
+            or getattr(self, 'resolution_aware_bn', False)
+            or state_dict_has_resaware_stats(checkpoint_state)
+        )
+        if needs_resaware:
+            convert_bn_to_resaware(self.image_model)
+
+        self.image_model.load_state_dict(checkpoint_state)
+        self.supported_resolutions = checkpoint_meta.get('resolution_scales') or []
+        if self.supported_resolutions:
+            print(f"Loaded res-aware checkpoint supporting scales: {self.supported_resolutions}")
+        self.checkpoint_wide_scale = checkpoint_meta.get('wide_scale')
+        self.checkpoint_narr_scale = checkpoint_meta.get('narr_scale')
         self.image_model.eval()
 
         self.vizs = []
@@ -101,15 +131,15 @@ class ImageAgent(AutonomousAgent):
     def sensors(self):
         sensors = [ # Sensors modified to match online leaderboard based on https://github.com/dotchen/WorldOnRails/issues/27
             {'type': 'sensor.speedometer', 'id': 'EGO'},
-            {'type': 'sensor.other.gnss', 'x': 0., 'y': 0.0, 'z': self.camera_z, 'id': 'GPS'},
+            {'type': 'sensor.other.gnss', 'x': 0., 'y': 0.0, 'z': self.camera_z, 'sensor_tick': self.sensor_tick or 0.0, 'id': 'GPS'},
             {'type': 'sensor.camera.rgb', 'x': self.camera_x, 'y': 0, 'z': self.camera_z, 'roll': 0.0, 'pitch': 0.0, 'yaw': -55.0,
-            'width': 160, 'height': 240, 'fov': 60, 'id': f'Wide_RGB_0'},
+            'width': 160, 'height': 240, 'fov': 60, 'sensor_tick': self.sensor_tick, 'id': f'Wide_RGB_0'},
             {'type': 'sensor.camera.rgb', 'x': self.camera_x, 'y': 0, 'z': self.camera_z, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
-            'width': 160, 'height': 240, 'fov': 60, 'id': f'Wide_RGB_1'},
+            'width': 160, 'height': 240, 'fov': 60, 'sensor_tick': self.sensor_tick, 'id': f'Wide_RGB_1'},
             {'type': 'sensor.camera.rgb', 'x': self.camera_x, 'y': 0, 'z': self.camera_z, 'roll': 0.0, 'pitch': 0.0, 'yaw':  55.0,
-            'width': 160, 'height': 240, 'fov': 60, 'id': f'Wide_RGB_2'},
+            'width': 160, 'height': 240, 'fov': 60, 'sensor_tick': self.sensor_tick, 'id': f'Wide_RGB_2'},
             {'type': 'sensor.camera.rgb', 'x': self.camera_x, 'y': 0, 'z': self.camera_z, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
-            'width': 384, 'height': 240, 'fov': 50, 'id': f'Narrow_RGB'},
+            'width': 384, 'height': 240, 'fov': 50, 'sensor_tick': self.sensor_tick, 'id': f'Narrow_RGB'},
         ]
         return sensors
 
@@ -120,6 +150,7 @@ class ImageAgent(AutonomousAgent):
             _, wide_rgb = input_data.get(f'Wide_RGB_{i}')
             wide_rgb_crop = wide_rgb[self.wide_crop_top:,:,:3]
             _wide_rgb = wide_rgb_crop[...,::-1].copy()
+            _wide_rgb = self._resize_rgb(_wide_rgb, self.wide_scale)
             wide_rgbs.append(_wide_rgb)
 
         wide_rgbs_con = np.concatenate([wide_rgbs[0],wide_rgbs[1],wide_rgbs[2]], axis=1)
@@ -129,6 +160,7 @@ class ImageAgent(AutonomousAgent):
         _, narr_rgb = input_data.get(f'Narrow_RGB')
         narr_rgb_crop = narr_rgb[:-self.narr_crop_bottom,:,:3]
         _narr_rgb = narr_rgb_crop[...,::-1].copy()
+        _narr_rgb = self._resize_rgb(_narr_rgb, self.narr_scale)
 
         # Crop images
         #_wide_rgb = wide_rgb[self.wide_crop_top:,:,:3]
@@ -245,6 +277,16 @@ class ImageAgent(AutonomousAgent):
         #     steer = min(max(steer, -0.4), 0.4) # no crazy steerings when lane changing
 
         return steer, throt, brake
+
+    def _resize_rgb(self, rgb, scale):
+        if scale is None or abs(scale - 1.0) < 1e-6:
+            return rgb
+        h, w = rgb.shape[:2]
+        new_size = (
+            max(1, int(round(w * scale))),
+            max(1, int(round(h * scale))),
+        )
+        return cv2.resize(rgb, new_size, interpolation=cv2.INTER_AREA)
     
 def load_state_dict(model, path):
 

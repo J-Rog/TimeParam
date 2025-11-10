@@ -5,8 +5,8 @@ import lmdb
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from common.augmenter import augment
-from utils import filter_sem
+from ...common.augmenter import augment
+from ...utils import filter_sem
 
 # CHANNELS = [
 #     4,  # Pedestrians    

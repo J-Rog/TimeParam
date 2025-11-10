@@ -38,7 +38,7 @@ def _location_to_gps(lat_ref, lon_ref, location):
     lat = 360.0 * math.atan(math.exp(my / (EARTH_RADIUS_EQUA * scale))) / math.pi - 90.0
     z = location.z
 
-    return {'lat': lat, 'lon': lon, 'z': z}
+    return {'lat': -lat, 'lon': lon, 'z': z}
 
 
 def location_route_to_gps(route, lat_ref, lon_ref):

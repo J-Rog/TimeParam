@@ -1,8 +1,8 @@
 import torch
 from torch import nn
-from common.resnet import resnet18, resnet34
-from common.normalize import Normalize
-from common.segmentation import SegmentationHead
+from pcla_agents.wor.common.resnet import resnet18, resnet34
+from pcla_agents.wor.common.normalize import Normalize
+from pcla_agents.wor.common.segmentation import SegmentationHead
 
 class CameraModel(nn.Module):
     def __init__(self, config, num_cmds=6):

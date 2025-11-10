@@ -4,6 +4,7 @@ from collections import defaultdict
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from .ego_dataset import EgoDataset
 from .main_dataset import LabeledMainDataset
+from .json_main_dataset import JSONMainDataset, JSONLabeledMainDataset
 
 def data_loader(data_type, config):
 
@@ -16,4 +17,4 @@ def data_loader(data_type, config):
 
     return DataLoader(dataset, batch_size=config.batch_size, num_workers=config.num_workers, shuffle=True, drop_last=True)
 
-__all__ = ['data_loader']
+__all__ = ['data_loader', 'EgoDataset', 'LabeledMainDataset', 'JSONMainDataset', 'JSONLabeledMainDataset']

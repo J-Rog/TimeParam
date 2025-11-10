@@ -8,7 +8,7 @@ class Waypointer:
     
     EARTH_RADIUS = 6371e3 # 6371km
     
-    def __init__(self, global_plan, current_gnss, threshold_lane=10., threshold_before=4.5, threshold_after=4.5, pop_lane_change=True):
+    def __init__(self, global_plan, current_gnss, threshold_lane=10., threshold_before=8, threshold_after=4.5, pop_lane_change=True):
         self._threshold_before = threshold_before
         self._threshold_after = threshold_after
         self._threshold_lane = threshold_lane
