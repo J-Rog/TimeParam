@@ -32,7 +32,7 @@ from leaderboard_codes.route_manipulation import interpolate_trajectory
 from leaderboard_codes.sensor_interface import CallBack, OpenDriveMapReader, SpeedometerReader
 
 class PCLA():
-    def __init__(self, agent, vehicle, route, client):
+    def __init__(self, agent, vehicle, route, client, agent_config_override=None):
         self.current_dir = os.path.dirname(os.path.abspath(__file__))
         self.client = None
         self.world = None
@@ -43,13 +43,16 @@ class PCLA():
         self.routePath = None
         self._watchdog = None
         self._managed_sensors = []
-        self.set(agent, vehicle, route, client)
+        self._agent_config_override = agent_config_override
+        self.set(agent, vehicle, route, client, agent_config_override)
     
-    def set(self, agent, vehicle, route, client):
+    def set(self, agent, vehicle, route, client, agent_config_override=None):
         self.client = client
         self.world = client.get_world()
         self.vehicle = vehicle
         self.routePath = route
+        if agent_config_override is not None:
+            self._agent_config_override = agent_config_override
         self._watchdog = Watchdog(260) # TODO: Increase timeout if needed for large models
         self.setup_agent(agent)
         self.setup_route()
@@ -59,6 +62,11 @@ class PCLA():
         GameTime.restart()
         self._watchdog.start()
         self.agentPath, self.configPath = give_path(agent, self.current_dir, self.routePath)
+        if self._agent_config_override:
+            override_path = os.path.abspath(self._agent_config_override)
+            if not os.path.isfile(override_path):
+                raise FileNotFoundError(f"Agent config override {override_path} not found")
+            self.configPath = override_path
 
         module_name = os.path.basename(self.agentPath).split('.')[0]
         sys.path.insert(0, os.path.dirname(self.agentPath))
@@ -170,6 +178,7 @@ class PCLA():
         self.configPath = None
         self.routePath = None
         self.world = None
+        self._agent_config_override = None
         
         CarlaDataProvider.cleanup()
         

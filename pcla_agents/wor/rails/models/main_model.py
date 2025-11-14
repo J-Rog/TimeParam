@@ -1,3 +1,5 @@
+from typing import Optional, Tuple
+
 import torch
 from torch import nn
 from pcla_agents.wor.common.resnet import resnet18, resnet34
@@ -19,6 +21,10 @@ class CameraModel(nn.Module):
         
         self.backbone_wide = resnet34(pretrained=config['imagenet_pretrained'])
         self.seg_head_wide = SegmentationHead(512, self.num_labels+1)
+        # Always register narrator modules so TorchScript sees consistent attributes.
+        self.backbone_narr = nn.Identity()
+        self.seg_head_narr = nn.Identity()
+        self.bottleneck_narr = nn.Identity()
         if self.two_cam:
             self.backbone_narr = resnet18(pretrained=config['imagenet_pretrained'])
             self.seg_head_narr = SegmentationHead(512, self.num_labels+1)
@@ -27,6 +33,7 @@ class CameraModel(nn.Module):
                 nn.ReLU(True),
             )
 
+        self.spd_encoder = nn.Identity()
         if self.all_speeds:
             self.num_acts = self.num_cmds*self.num_speeds*(self.num_steers+self.num_throts+1)
         else:
@@ -49,13 +56,19 @@ class CameraModel(nn.Module):
         
         self.normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-    def forward(self, wide_rgb, narr_rgb, spd=None):
+    def forward(
+        self,
+        wide_rgb: torch.Tensor,
+        narr_rgb: torch.Tensor,
+        spd: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         
         assert (self.all_speeds and spd is None) or \
                (not self.all_speeds and spd is not None)
 
         wide_embed = self.backbone_wide(self.normalize(wide_rgb/255.))
         wide_seg_output = self.seg_head_wide(wide_embed)
+        narr_seg_output = wide_seg_output
 
         if self.two_cam:
             narr_embed = self.backbone_narr(self.normalize(narr_rgb/255.))
@@ -73,13 +86,11 @@ class CameraModel(nn.Module):
             act_output = self.act_head(embed).view(-1,self.num_cmds,self.num_speeds,self.num_steers+self.num_throts+1)
             act_output = action_logits(act_output, self.num_steers, self.num_throts)
         else:
+            assert spd is not None
             act_output = self.act_head(torch.cat([embed, self.spd_encoder(spd[:,None])], dim=1)).view(-1,self.num_cmds,1,self.num_steers+self.num_throts+1)
             act_output = action_logits(act_output, self.num_steers, self.num_throts).squeeze(2)
 
-        if self.two_cam:
-            return act_output, wide_seg_output, narr_seg_output
-        else:
-            return act_output, wide_seg_output
+        return act_output, wide_seg_output, narr_seg_output
 
 
     @torch.no_grad()
@@ -106,6 +117,7 @@ class CameraModel(nn.Module):
             throt_logits = act_output[0,cmd,:,self.num_steers:self.num_steers+self.num_throts]
             brake_logits = act_output[0,cmd,:,-1]
         else:
+            assert spd is not None
             act_output = self.act_head(torch.cat([embed, self.spd_encoder(spd[:,None])], dim=1)).view(-1,self.num_cmds,1,self.num_steers+self.num_throts+1)
             
             # Action logits
@@ -116,7 +128,7 @@ class CameraModel(nn.Module):
         return steer_logits, throt_logits, brake_logits
 
 
-def action_logits(raw_logits, num_steers, num_throts):
+def action_logits(raw_logits: torch.Tensor, num_steers: int, num_throts: int) -> torch.Tensor:
     
     steer_logits = raw_logits[...,:num_steers]
     throt_logits = raw_logits[...,num_steers:num_steers+num_throts]

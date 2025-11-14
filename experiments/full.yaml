@@ -1,0 +1,199 @@
+experiments:
+  - name: bn_r075
+    agent: wor_bn
+    agent_config: outputs/config_bn.yaml
+    config_overrides:
+      main_model_dir: outputs/bn_0.75r_no_mlp.th
+      wide_scale: 0.75
+      narr_scale: 0.75
+      resolution_aware_bn: False
+    latencies: [0.2, 0.15, 0.1, 0.05]
+    vehicle_densities: [0, 5, 20]
+    pedestrian_densities: [0, 10, 40]
+    routes:
+      - name: route0
+        route: routes/routes_training.xml
+        route_id: 0
+        sweep_log: throwaway/0.75r_route0.csv
+      - name: route1
+        route: routes/routes_training.xml
+        route_id: 1
+        sweep_log: throwaway/0.75r_route1.csv
+      - name: route2
+        route: routes/routes_devtest.xml
+        route_id: 0
+        sweep_log: throwaway/0.75r_route2.csv
+      - name: route3
+        route: routes/routes_devtest.xml
+        route_id: 1
+        sweep_log: throwaway/0.75r_route3.csv
+
+  - name: bn_r100
+    agent: wor_bn
+    agent_config: outputs/config_bn.yaml
+    config_overrides:
+      main_model_dir: outputs/bn_1.0r_no_mlp.th
+      wide_scale: 1.00
+      narr_scale: 1.00
+      resolution_aware_bn: False
+    latencies: [ 0.05]
+    vehicle_densities: [0, 5, 20]
+    pedestrian_densities: [0, 10, 40]
+    routes:
+      - name: route0
+        route: routes/routes_training.xml
+        route_id: 0
+        sweep_log: throwaway/1.00r_route0.csv
+      - name: route1
+        route: routes/routes_training.xml
+        route_id: 1
+        sweep_log: throwaway/1.00r_route1.csv
+      - name: route2
+        route: routes/routes_devtest.xml
+        route_id: 0
+        sweep_log: throwaway/1.00r_route2.csv
+      - name: route3
+        route: routes/routes_devtest.xml
+        route_id: 1
+        sweep_log: throwaway/1.00r_route3.csv
+
+  - name: resaware_r100
+    agent: wor_bn
+    agent_config: outputs/config_bn.yaml
+    config_overrides:
+      main_model_dir: outputs/resaware_bn_finetuned.th
+      wide_scale: 1.0
+      narr_scale: 1.0
+      resolution_aware_bn: True
+    latencies: [0.2, 0.15, 0.1, 0.05]
+    vehicle_densities: [0, 5, 20]
+    pedestrian_densities: [0, 10, 40]
+    routes:
+      - name: route0
+        route: routes/routes_training.xml
+        route_id: 0
+        sweep_log: throwaway/1.0r_resaware_route0.csv
+      - name: route1
+        route: routes/routes_training.xml
+        route_id: 1
+        sweep_log: throwaway/1.0r_resaware_route1.csv
+      - name: route2
+        route: routes/routes_devtest.xml
+        route_id: 0
+        sweep_log: throwaway/1.0r_resaware_route2.csv
+      - name: route3
+        route: routes/routes_devtest.xml
+        route_id: 1
+        sweep_log: throwaway/1.0r_resaware_route3.csv
+
+  - name: resaware_r075
+    agent: wor_bn
+    agent_config: outputs/config_bn.yaml
+    config_overrides:
+      main_model_dir: outputs/resaware_bn_finetuned.th
+      wide_scale: 0.75
+      narr_scale: 0.75
+      resolution_aware_bn: True
+    latencies: [0.2, 0.15, 0.1, 0.05]
+    vehicle_densities: [0, 5, 20]
+    pedestrian_densities: [0, 10, 40]
+    routes:
+      - name: route0
+        route: routes/routes_training.xml
+        route_id: 0
+        sweep_log: throwaway/0.75r_resaware_route0.csv
+      - name: route1
+        route: routes/routes_training.xml
+        route_id: 1
+        sweep_log: throwaway/0.75r_resaware_route1.csv
+      - name: route2
+        route: routes/routes_devtest.xml
+        route_id: 0
+        sweep_log: throwaway/0.75r_resaware_route2.csv
+      - name: route3
+        route: routes/routes_devtest.xml
+        route_id: 1
+        sweep_log: throwaway/0.75r_resaware_route3.csv
+
+  - name: resaware_multires_0.05to0.1
+    script: test_wor_multires.py
+    agent: wor_bn
+    agent_config: outputs/config_bn.yaml
+    config_overrides:
+      main_model_dir: outputs/resaware_bn_finetuned.th
+      resolution_aware_bn: True
+    extra_args:
+      - --lane-wide-scale
+      - "0.75"
+      - --lane-narr-scale
+      - "0.75"
+      - --traffic-light-wide-scale
+      - "1.0"
+      - --traffic-light-narr-scale
+      - "1.0"
+      - --traffic-light-latency
+      - "0.1"
+      - --traffic-light-distance
+      - "5.0"
+    latencies: [0.05]
+    vehicle_densities: [0, 5, 20]
+    pedestrian_densities: [0, 10, 40]
+    routes:
+      - name: route0
+        route: routes/routes_training.xml
+        route_id: 0
+        sweep_log: throwaway/0.05to0.1r_resaware_route0.csv
+      - name: route1
+        route: routes/routes_training.xml
+        route_id: 1
+        sweep_log: throwaway/0.05to0.1r_resaware_route1.csv
+      - name: route2
+        route: routes/routes_devtest.xml
+        route_id: 0
+        sweep_log: throwaway/0.05to0.1r_resaware_route2.csv
+      - name: route3
+        route: routes/routes_devtest.xml
+        route_id: 1
+        sweep_log: throwaway/0.05to0.1r_resaware_route3.csv
+  
+  - name: resaware_multires_0.1to0.15
+    script: test_wor_multires.py
+    agent: wor_bn
+    agent_config: outputs/config_bn.yaml
+    config_overrides:
+      main_model_dir: outputs/resaware_bn_finetuned.th
+      resolution_aware_bn: True
+    extra_args:
+      - --lane-wide-scale
+      - "0.75"
+      - --lane-narr-scale
+      - "0.75"
+      - --traffic-light-wide-scale
+      - "1.0"
+      - --traffic-light-narr-scale
+      - "1.0"
+      - --traffic-light-latency
+      - "0.15"
+      - --traffic-light-distance
+      - "5.0"
+    latencies: [0.1]
+    vehicle_densities: [0, 5, 20]
+    pedestrian_densities: [0, 10, 40]
+    routes:
+      - name: route0
+        route: routes/routes_training.xml
+        route_id: 0
+        sweep_log: throwaway/0.1to0.15r_resaware_route0.csv
+      - name: route1
+        route: routes/routes_training.xml
+        route_id: 1
+        sweep_log: throwaway/0.1to0.15r_resaware_route1.csv
+      - name: route2
+        route: routes/routes_devtest.xml
+        route_id: 0
+        sweep_log: throwaway/0.1to0.15r_resaware_route2.csv
+      - name: route3
+        route: routes/routes_devtest.xml
+        route_id: 1
+        sweep_log: throwaway/0.1to0.15r_resaware_route3.csv
+    

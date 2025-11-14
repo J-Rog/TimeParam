@@ -58,10 +58,11 @@ class RAILS:
 
         act_probs = F.softmax(act_vals/self.temperature, dim=3)
         
-        if self.use_narr_cam:
-            act_outputs, wide_seg_outputs, narr_seg_outputs = self.main_model(wide_rgbs, narr_rgbs, spd=None if self.all_speeds else spds)
-        else:
-            act_outputs, wide_seg_outputs = self.main_model(wide_rgbs, narr_rgbs, spd=None if self.all_speeds else spds)
+        act_outputs, wide_seg_outputs, narr_seg_outputs = self.main_model(
+            wide_rgbs,
+            narr_rgbs,
+            spd=None if self.all_speeds else spds,
+        )
         
         if self.all_speeds:
             act_loss = F.kl_div(F.log_softmax(act_outputs, dim=3), act_probs, reduction='none').mean(dim=[2,3])
@@ -79,8 +80,11 @@ class RAILS:
         act_loss = torch.mean(torch.where(is_turn, turn_loss, foll_loss) + torch.where(is_lane, lane_loss, foll_loss))
         seg_loss = F.cross_entropy(F.interpolate(wide_seg_outputs,scale_factor=4), wide_sems)
 
-        if self.use_narr_cam:
-            seg_loss = seg_loss + F.cross_entropy(F.interpolate(narr_seg_outputs,scale_factor=4), narr_sems)
+        if self.use_narr_cam and narr_seg_outputs is not None:
+            seg_loss = seg_loss + F.cross_entropy(
+                F.interpolate(narr_seg_outputs,scale_factor=4),
+                narr_sems,
+            )
             seg_loss = seg_loss / 2
 
         loss = act_loss + self.seg_weight * seg_loss

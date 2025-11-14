@@ -13,6 +13,7 @@ import cv2
 from torch.distributions.categorical import Categorical
 
 from leaderboard_codes.autonomous_agent1 import AutonomousAgent, Track
+from leaderboard_codes.local_planner import RoadOption
 from utils import visualize_obs
 
 from rails.models import (
@@ -39,6 +40,8 @@ class ImageAgent(AutonomousAgent):
 
         self.track = Track.SENSORS
         self.num_frames = 0
+        self.latest_lane_follow = True
+        self.latest_route_command = None
 
         config_dir = os.path.dirname(os.path.abspath(path_to_conf_file))
 
@@ -178,6 +181,8 @@ class ImageAgent(AutonomousAgent):
             self.waypointer = Waypointer(self._global_plan, gps)
 
         _, _, cmd = self.waypointer.tick(gps)
+        self.latest_route_command = cmd
+        self.latest_lane_follow = (cmd == RoadOption.LANEFOLLOW)
 
         spd = ego.get('speed')
         

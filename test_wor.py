@@ -5,11 +5,12 @@ import random
 import sys
 import time
 import math
-from datetime import datetime
-from itertools import product
-from types import SimpleNamespace
+import copy
 import argparse
 import numpy as np
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from types import SimpleNamespace
 try:
     import pygame
 except ImportError:
@@ -185,6 +186,7 @@ class LeaderboardLikeScorer:
 
         self._wallclock_start = time.time()
         self.sim_time = 0.0
+
 
     def on_collision(self, event):
         other = event.other_actor
@@ -511,10 +513,10 @@ def parse_args():
         help="Print GNSS readings vs. route GPS (converted from x,y,z) to debug mismatches.",
     )
     parser.add_argument(
-        "--control-period",
+        "--control-latency",
         type=float,
         default=0.05,
-        help="Control command period in seconds.",
+        help="Latency between sensing and actuation in seconds. Also sets the control period (sample-and-hold).",
     )
     parser.add_argument(
         "--vehicle-density",
@@ -529,10 +531,10 @@ def parse_args():
         help="Number of pedestrians to spawn (density proxy).",
     )
     parser.add_argument(
-        "--sweep-control-periods",
+        "--sweep-control-latencies",
         type=float,
         nargs="+",
-        help="If set, run once for each listed control period (seconds).",
+        help="If set, run once for each listed control latency (seconds).",
     )
     parser.add_argument(
         "--sweep-vehicle-density",
@@ -556,6 +558,16 @@ def parse_args():
         action="store_true",
         help="Reload the CARLA world before each sweep run instead of reusing the previous one.",
     )
+    parser.add_argument(
+        "--agent-config",
+        type=str,
+        help="Override path to the agent config file (useful when testing multiple checkpoints).",
+    )
+    parser.add_argument(
+        "--route-id",
+        type=int,
+        help="Restrict the provided route XML to this <route id>. When unset, the first route is used.",
+    )
     return parser.parse_args()
 
 
@@ -568,8 +580,9 @@ class SweepLogger:
         "route_xml",
         "agent",
         "control_period",
-        "effective_control_period",
+        "control_latency",
         "control_steps",
+        "latency_steps",
         "vehicle_density",
         "pedestrian_density",
         "status",
@@ -794,26 +807,67 @@ def _apply_route_weather(world, route_config):
         print(f"Failed to apply route weather ({exc}); continuing with current weather settings.")
 
 
+def _materialize_route_subset(route_xml, route_id):
+    """
+    Create a temporary route file that only contains the selected <route id>.
+    """
+    tree = ET.parse(route_xml)
+    root = tree.getroot()
+    target = None
+    for route_elem in root.findall("route"):
+        if route_elem.get("id") == str(route_id):
+            target = copy.deepcopy(route_elem)
+            break
+    if target is None:
+        raise ValueError(f"Route id {route_id} not found in {route_xml}")
+
+    new_root = ET.Element(root.tag)
+    for child in root:
+        if child.tag != "route":
+            new_root.append(copy.deepcopy(child))
+    new_root.append(target)
+
+    out_dir = os.path.join(CURRENT_DIR, "tmp", "routes")
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(route_xml))[0]
+    out_path = os.path.join(out_dir, f"{base}_route{route_id}.xml")
+    ET.ElementTree(new_root).write(out_path, encoding="utf-8", xml_declaration=True)
+    return out_path
+
+
+def _clone_control(control):
+    clone = carla.VehicleControl()
+    clone.throttle = control.throttle
+    clone.steer = control.steer
+    clone.brake = control.brake
+    clone.hand_brake = control.hand_brake
+    clone.reverse = control.reverse
+    clone.manual_gear_shift = control.manual_gear_shift
+    clone.gear = control.gear
+    return clone
+
+
 # ---------- main ----------
 
 def run_configuration(args, client, world, tm_port, route_xml, preview_config,
-                      control_period, vehicle_density, pedestrian_density):
-    if control_period <= 0:
-        raise ValueError("Control period must be positive")
+                      control_latency, vehicle_density, pedestrian_density):
+    if control_latency <= 0:
+        raise ValueError("Control latency must be positive")
 
-    FIXED_DT = 0.05
+    FIXED_DT = 0.025
     STUCK_SPEED_THRESHOLD = 0.2  # m/s
     STUCK_TIME_SECONDS = 8.0
+    MAX_LOW_SPEED_SECONDS = 40.0
 
     _apply_route_weather(world, preview_config)
     tm = client.get_trafficmanager(tm_port)
 
-    control_steps = max(1, int(round(control_period / FIXED_DT)))
-    effective_control_period = control_steps * FIXED_DT
-    if abs(effective_control_period - control_period) > 1e-6:
+    latency_steps = max(1, int(round(control_latency / FIXED_DT)))
+    effective_control_latency = latency_steps * FIXED_DT
+    if abs(effective_control_latency - control_latency) > 1e-6:
         print(
-            f"Requested control period {control_period:.3f}s rounded to "
-            f"{effective_control_period:.3f}s (steps={control_steps})."
+            f"Requested control latency {control_latency:.3f}s rounded to "
+            f"{effective_control_latency:.3f}s (steps={latency_steps})."
         )
 
     dense_route_preview = interpolate_trajectory(world, preview_config.trajectory)[1]
@@ -903,7 +957,7 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
         walkers, walker_controllers = spawn_walkers(client, world, n_walkers=pedestrian_density, seed=42)
 
         agent_name = args.agent
-        pcla = PCLA(agent_name, ego, route_xml, client)
+        pcla = PCLA(agent_name, ego, route_xml, client, agent_config_override=args.agent_config)
         scorer = LeaderboardLikeScorer(world, route_xml)
 
         collision_bp = bp_lib.find('sensor.other.collision')
@@ -936,12 +990,16 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
         )
 
         stuck_frames = 0
-        steps_since_action = control_steps
-        pending_control = carla.VehicleControl()
+        low_speed_frames = 0
+        pending_control = _clone_control(pcla.get_action())
+        applied_control = carla.VehicleControl()
+        next_apply_tick = latency_steps
+        sim_ticks = 0
         terminal_message = ""
 
         while True:
             world.tick()
+            sim_ticks += 1
             monitor = getattr(world, "_tm_monitor", None)
             if monitor:
                 monitor()
@@ -952,10 +1010,11 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
 
             spd_ms = ego.get_velocity().length()
             scorer.clear_collision_block_if_recovered(spd_ms)
+            low_speed_frames = low_speed_frames + 1 if spd_ms < STUCK_SPEED_THRESHOLD else 0
             if (
                 spd_ms < STUCK_SPEED_THRESHOLD
                 and (
-                    (pending_control.throttle > 0.3 and pending_control.brake < 0.1)
+                    (applied_control.throttle > 0.3 and applied_control.brake < 0.1)
                     or scorer.collision_block_active()
                 )
             ):
@@ -974,7 +1033,7 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
             overlay_lines.extend(
                 vehicle_overlay_lines(
                     ego,
-                    pending_control,
+                    applied_control,
                     scorer.route_tracker,
                     dense_route_preview,
                     scorer.get_red_light_events(),
@@ -993,6 +1052,13 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
                         f"(current {distance_to_wp:.2f} m at index {idx})."
                     )
                     break
+            if low_speed_frames * FIXED_DT >= MAX_LOW_SPEED_SECONDS:
+                terminal_message = "low_speed_timeout"
+                print(
+                    f"Aborting run: vehicle stayed below {STUCK_SPEED_THRESHOLD:.2f} m/s for "
+                    f"{low_speed_frames * FIXED_DT:.1f}s."
+                )
+                break
 
             if scorer.completed_event_sent:
                 terminal_message = "route_completed"
@@ -1028,11 +1094,12 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
                 for controller in walker_controllers:
                     controller.go_to_location(world.get_random_location_from_navigation())
 
-            if steps_since_action >= control_steps:
-                pending_control = pcla.get_action()
-                steps_since_action = 0
-            ego.apply_control(pending_control)
-            steps_since_action += 1
+            if sim_ticks >= next_apply_tick:
+                applied_control = _clone_control(pending_control)
+                pending_control = _clone_control(pcla.get_action())
+                next_apply_tick = sim_ticks + latency_steps
+
+            ego.apply_control(applied_control)
 
         status = "completed" if scorer.completed_event_sent else "aborted"
         message = terminal_message or ("route_completed" if status == "completed" else "manual_stop")
@@ -1095,9 +1162,10 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
         'route_id': scorer.route_id,
         'route_xml': route_xml,
         'agent': args.agent,
-        'control_period': float(control_period),
-        'effective_control_period': float(effective_control_period),
-        'control_steps': control_steps,
+        'control_period': float(control_latency),
+        'control_latency': float(control_latency),
+        'control_steps': latency_steps,
+        'latency_steps': latency_steps,
         'vehicle_density': vehicle_density,
         'pedestrian_density': pedestrian_density,
         'status': status,
@@ -1124,6 +1192,15 @@ def main():
     route_xml = os.path.abspath(args.route)
     if not os.path.isfile(route_xml):
         raise FileNotFoundError(f"Route file {route_xml} not found")
+    if args.route_id is not None:
+        route_xml = _materialize_route_subset(route_xml, args.route_id)
+        print(f"Using only route id {args.route_id} from {args.route} -> {route_xml}")
+    if args.agent_config:
+        args.agent_config = os.path.abspath(args.agent_config)
+        if not os.path.isfile(args.agent_config):
+            raise FileNotFoundError(f"Agent config override {args.agent_config} not found")
+    if args.control_latency < 0:
+        raise ValueError("Control latency must be non-negative")
 
     scenario_json = os.path.join(CURRENT_DIR, "leaderboard_codes", "no_scenarios.json")
     preview_indexer = LegacyRouteIndexer(route_xml, scenario_json, 1)
@@ -1139,9 +1216,12 @@ def main():
     client.set_timeout(10.0)
     tm_port = DEFAULT_TM_PORT
 
-    control_periods = args.sweep_control_periods or [args.control_period]
     vehicle_counts = args.sweep_vehicle_density or [args.vehicle_density]
     pedestrian_counts = args.sweep_pedestrian_density or [args.pedestrian_density]
+    control_latencies = args.sweep_control_latencies or [args.control_latency]
+
+    if any(lat <= 0 for lat in control_latencies):
+        raise ValueError("All control latencies must be positive")
 
     def _build_density_pairs(vehicles, pedestrians):
         vehicle_sweep = bool(args.sweep_vehicle_density)
@@ -1161,13 +1241,14 @@ def main():
 
     density_pairs = _build_density_pairs(vehicle_counts, pedestrian_counts)
     combos = [
-        (cp, veh_count, ped_count)
-        for cp, (veh_count, ped_count) in product(control_periods, density_pairs)
+        (latency, veh_count, ped_count)
+        for latency in control_latencies
+        for (veh_count, ped_count) in density_pairs
     ]
 
     print(
         f"Preparing {len(combos)} configuration{'s' if len(combos) != 1 else ''} "
-        f"(control_periods={control_periods}, density_pairs={density_pairs})."
+        f"(control_latencies={control_latencies}, density_pairs={density_pairs})."
     )
 
     sweep_logger = SweepLogger(args.sweep_log)
@@ -1175,9 +1256,9 @@ def main():
     world = _load_world_and_wait(client, route_town)
 
     try:
-        for idx, (control_period, vehicle_count, pedestrian_count) in enumerate(combos, start=1):
+        for idx, (control_latency, vehicle_count, pedestrian_count) in enumerate(combos, start=1):
             print(
-                f"\n=== Run {idx}/{len(combos)}: control_period={control_period:.3f}s | "
+                f"\n=== Run {idx}/{len(combos)}: latency={control_latency:.3f}s | "
                 f"vehicles={vehicle_count} | pedestrians={pedestrian_count} ==="
             )
 
@@ -1201,7 +1282,7 @@ def main():
                     tm_port,
                     route_xml,
                     preview_config,
-                    control_period,
+                    control_latency,
                     vehicle_count,
                     pedestrian_count,
                 )
@@ -1220,9 +1301,10 @@ def main():
                     'route_id': route_fallback_id,
                     'route_xml': route_xml,
                     'agent': args.agent,
-                    'control_period': float(control_period),
-                    'effective_control_period': None,
+                    'control_period': float(control_latency),
+                    'control_latency': float(control_latency),
                     'control_steps': None,
+                    'latency_steps': None,
                     'vehicle_density': vehicle_count,
                     'pedestrian_density': pedestrian_count,
                     'status': 'error',

@@ -10,6 +10,7 @@ def aggregate_logs_from_filenames(base_dir: str = ".", routes=(0, 1)):
     Filenames must follow the pattern: '<resolution>r_route<id>.csv'
     e.g., '0.75r_route0.csv', '1.0r_route1.csv'
     """
+    #(?:_resaware)?
     pattern = re.compile(r"(?P<resolution>[0-9.]+)r_route(?P<route_id>\d+)\.csv$")
     dfs = []
 
@@ -32,8 +33,16 @@ def aggregate_logs_from_filenames(base_dir: str = ".", routes=(0, 1)):
     df = pd.concat(dfs, ignore_index=True)
 
     # Convert numerics
+    for col, default in {
+        "control_latency": 0.0,
+        "latency_steps": 0
+    }.items():
+        if col not in df.columns:
+            df[col] = default
+
     numeric_cols = [
-        "control_period","effective_control_period","control_steps",
+        "control_period","control_latency",
+        "control_steps","latency_steps",
         "vehicle_density","pedestrian_density","route_completion",
         "sim_time","wall_time","lane_crossings",
         "collisions_vehicle","collisions_pedestrian","collisions_static","red_lights"
@@ -44,7 +53,24 @@ def aggregate_logs_from_filenames(base_dir: str = ".", routes=(0, 1)):
 
     df["timestamp"] = pd.to_datetime(df.get("timestamp", pd.NaT), errors="coerce")
     df["control_period_rounded"] = df["control_period"].round(2)
+    df["control_latency_rounded"] = df["control_latency"].round(2)
     df["success"] = (df["status"] == "completed").astype(int)
+
+    collision_cols = ["collisions_vehicle","collisions_pedestrian","collisions_static"]
+    for col in collision_cols:
+        if col not in df.columns:
+            df[col] = 0
+
+    df["any_collision"] = (
+        df[collision_cols]
+        .fillna(0)
+        .gt(0)
+        .any(axis=1)
+        .astype(int)
+    )
+    df["vehicle_collision_flag"] = (df["collisions_vehicle"] > 0).astype(int)
+    df["ped_collision_flag"] = (df["collisions_pedestrian"] > 0).astype(int)
+    df["static_collision_flag"] = (df["collisions_static"] > 0).astype(int)
 
     # ---- 1. Summary by resolution ----
     agg_by_res = (
@@ -52,6 +78,10 @@ def aggregate_logs_from_filenames(base_dir: str = ".", routes=(0, 1)):
         .agg(
             runs=("status","count"),
             success_rate=("success","mean"),
+            collision_rate=("any_collision","mean"),
+            vehicle_collision_rate=("vehicle_collision_flag","mean"),
+            ped_collision_rate=("ped_collision_flag","mean"),
+            static_collision_rate=("static_collision_flag","mean"),
             mean_completion=("route_completion","mean"),
             mean_sim_time=("sim_time","mean"),
             mean_wall_time=("wall_time","mean"),
@@ -62,52 +92,90 @@ def aggregate_logs_from_filenames(base_dir: str = ".", routes=(0, 1)):
             sum_red_lights=("red_lights","sum")
         ).reset_index()
     )
-    agg_by_res["success_rate"] = (100 * agg_by_res["success_rate"]).round(1)
+    rate_cols = [
+        "success_rate",
+        "collision_rate",
+        "vehicle_collision_rate",
+        "ped_collision_rate",
+        "static_collision_rate"
+    ]
+    for col in rate_cols:
+        agg_by_res[col] = (100 * agg_by_res[col]).round(1)
 
     # ---- 2. Success & safety by resolution × control period ----
     agg_res_cp = (
-        df.groupby(["resolution","control_period_rounded"])
+        df.groupby(["resolution","control_period_rounded","control_latency_rounded"])
         .agg(
             runs=("status","count"),
             success_rate=("success","mean"),
+            collision_rate=("any_collision","mean"),
+            vehicle_collision_rate=("vehicle_collision_flag","mean"),
+            ped_collision_rate=("ped_collision_flag","mean"),
+            static_collision_rate=("static_collision_flag","mean"),
             mean_completion=("route_completion","mean"),
             median_lane_crossings=("lane_crossings","median"),
+            mean_lane_crossings=("lane_crossings","mean"),
+            std_lane_crossings=("lane_crossings","std"),
             sum_collisions_vehicle=("collisions_vehicle","sum"),
             sum_collisions_ped=("collisions_pedestrian","sum"),
             sum_collisions_static=("collisions_static","sum"),
             red_lights=("red_lights","sum")
         ).reset_index()
-        .sort_values(["resolution","control_period_rounded"])
+        .sort_values(["resolution","control_period_rounded","control_latency_rounded"])
     )
-    agg_res_cp["success_rate"] = (100 * agg_res_cp["success_rate"]).round(1)
+    rate_cols_cp = [
+        "success_rate",
+        "collision_rate",
+        "vehicle_collision_rate",
+        "ped_collision_rate",
+        "static_collision_rate"
+    ]
+    for col in rate_cols_cp:
+        agg_res_cp[col] = (100 * agg_res_cp[col]).round(1)
     agg_res_cp["mean_completion"] = agg_res_cp["mean_completion"].round(2)
+    agg_res_cp["median_lane_crossings"] = agg_res_cp["median_lane_crossings"].round(2)
+    agg_res_cp["mean_lane_crossings"] = agg_res_cp["mean_lane_crossings"].round(2)
+    agg_res_cp["std_lane_crossings"] = (
+        agg_res_cp["std_lane_crossings"]
+        .fillna(0)
+        .round(2)
+    )
 
     # ---- 3. Failures ----
     failures = (
         df[df["status"] != "completed"]
-        .groupby(["resolution","control_period_rounded","vehicle_density","pedestrian_density","message"])
+        .groupby([
+            "resolution",
+            "control_period_rounded",
+            "control_latency_rounded",
+            "vehicle_density",
+            "pedestrian_density",
+            "message"
+        ])
         .size()
         .reset_index(name="count")
     )
 
     # ---- 4. By route ----
     agg_by_route = (
-        df.groupby(["resolution","route_id","control_period_rounded"])
+        df.groupby(["resolution","route_id","control_period_rounded","control_latency_rounded"])
         .agg(
             runs=("status","count"),
             success_rate=("success","mean"),
+            collision_rate=("any_collision","mean"),
             mean_lane_crossings=("lane_crossings","mean")
         ).reset_index()
-        .sort_values(["resolution","route_id","control_period_rounded"])
+        .sort_values(["resolution","route_id","control_period_rounded","control_latency_rounded"])
     )
     agg_by_route["success_rate"] = (100 * agg_by_route["success_rate"]).round(1)
+    agg_by_route["collision_rate"] = (100 * agg_by_route["collision_rate"]).round(1)
     agg_by_route["mean_lane_crossings"] = agg_by_route["mean_lane_crossings"].round(2)
 
     # Print summaries
     print("\n=== Summary by resolution ===")
     print(agg_by_res.to_string(index=False))
 
-    print("\n=== Success and safety by resolution × control period ===")
+    print("\n=== Success and safety by resolution × control period × control latency ===")
     print(agg_res_cp.to_string(index=False))
 
     print("\n=== Failures (non-completions) ===")
