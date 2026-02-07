@@ -144,7 +144,7 @@ experiments:
         sweep_log: outputs/0.75r_resaware_route3.csv
 
   - name: resaware_multires_0.05to0.1
-    script: test_wor_multires.py
+    script: test_wor_switching.py
     agent: wor_bn
     agent_config: outputs/config_bn.yaml
     config_overrides:
@@ -185,7 +185,7 @@ experiments:
         sweep_log: outputs/0.05to0.1r_resaware_route3.csv
   
   - name: resaware_multires_0.1to0.15
-    script: test_wor_multires.py
+    script: test_wor_switching.py
     agent: wor_bn
     agent_config: outputs/config_bn.yaml
     config_overrides:
