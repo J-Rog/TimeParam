@@ -1,4 +1,32 @@
 experiments:
+  - name: original_nc
+    agent: wor_nc
+    agent_config: pcla_agents/wor_pretrained/nocrash_weights/config_nocrash.yaml
+    config_overrides:
+      main_model_dir: pcla_agents/wor_pretrained/nocrash_weights/main_model_16.th
+      wide_scale: 1.00
+      narr_scale: 1.00
+      resolution_aware_bn: False
+    latencies: [0.2, 0.15, 0.1, 0.05]
+    vehicle_densities: [0, 5, 20]
+    pedestrian_densities: [0, 10, 40]
+    routes:
+      - name: route0
+        route: routes/routes_training.xml
+        route_id: 0
+        sweep_log: outputs/nc_route0.csv
+      - name: route1
+        route: routes/routes_training.xml
+        route_id: 1
+        sweep_log: outputs/nc_route1.csv
+      - name: route2
+        route: routes/routes_devtest.xml
+        route_id: 0
+        sweep_log: outputs/nc_route2.csv
+      - name: route3
+        route: routes/routes_devtest.xml
+        route_id: 1
+        sweep_log: outputs/nc_route3.csv
   - name: bn_r075
     agent: wor_bn
     agent_config: outputs/config_bn.yaml
@@ -14,19 +42,19 @@ experiments:
       - name: route0
         route: routes/routes_training.xml
         route_id: 0
-        sweep_log: throwaway/0.75r_route0.csv
+        sweep_log: outputs/0.75r_route0.csv
       - name: route1
         route: routes/routes_training.xml
         route_id: 1
-        sweep_log: throwaway/0.75r_route1.csv
+        sweep_log: outputs/0.75r_route1.csv
       - name: route2
         route: routes/routes_devtest.xml
         route_id: 0
-        sweep_log: throwaway/0.75r_route2.csv
+        sweep_log: outputs/0.75r_route2.csv
       - name: route3
         route: routes/routes_devtest.xml
         route_id: 1
-        sweep_log: throwaway/0.75r_route3.csv
+        sweep_log: outputs/0.75r_route3.csv
 
   - name: bn_r100
     agent: wor_bn
@@ -36,26 +64,26 @@ experiments:
       wide_scale: 1.00
       narr_scale: 1.00
       resolution_aware_bn: False
-    latencies: [ 0.05]
+    latencies: [0.2, 0.15, 0.1, 0.05]
     vehicle_densities: [0, 5, 20]
     pedestrian_densities: [0, 10, 40]
     routes:
       - name: route0
         route: routes/routes_training.xml
         route_id: 0
-        sweep_log: throwaway/1.00r_route0.csv
+        sweep_log: outputs/1.00r_route0.csv
       - name: route1
         route: routes/routes_training.xml
         route_id: 1
-        sweep_log: throwaway/1.00r_route1.csv
+        sweep_log: outputs/1.00r_route1.csv
       - name: route2
         route: routes/routes_devtest.xml
         route_id: 0
-        sweep_log: throwaway/1.00r_route2.csv
+        sweep_log: outputs/1.00r_route2.csv
       - name: route3
         route: routes/routes_devtest.xml
         route_id: 1
-        sweep_log: throwaway/1.00r_route3.csv
+        sweep_log: outputs/1.00r_route3.csv
 
   - name: resaware_r100
     agent: wor_bn
@@ -72,19 +100,19 @@ experiments:
       - name: route0
         route: routes/routes_training.xml
         route_id: 0
-        sweep_log: throwaway/1.0r_resaware_route0.csv
+        sweep_log: outputs/1.0r_resaware_route0.csv
       - name: route1
         route: routes/routes_training.xml
         route_id: 1
-        sweep_log: throwaway/1.0r_resaware_route1.csv
+        sweep_log: outputs/1.0r_resaware_route1.csv
       - name: route2
         route: routes/routes_devtest.xml
         route_id: 0
-        sweep_log: throwaway/1.0r_resaware_route2.csv
+        sweep_log: outputs/1.0r_resaware_route2.csv
       - name: route3
         route: routes/routes_devtest.xml
         route_id: 1
-        sweep_log: throwaway/1.0r_resaware_route3.csv
+        sweep_log: outputs/1.0r_resaware_route3.csv
 
   - name: resaware_r075
     agent: wor_bn
@@ -101,19 +129,19 @@ experiments:
       - name: route0
         route: routes/routes_training.xml
         route_id: 0
-        sweep_log: throwaway/0.75r_resaware_route0.csv
+        sweep_log: outputs/0.75r_resaware_route0.csv
       - name: route1
         route: routes/routes_training.xml
         route_id: 1
-        sweep_log: throwaway/0.75r_resaware_route1.csv
+        sweep_log: outputs/0.75r_resaware_route1.csv
       - name: route2
         route: routes/routes_devtest.xml
         route_id: 0
-        sweep_log: throwaway/0.75r_resaware_route2.csv
+        sweep_log: outputs/0.75r_resaware_route2.csv
       - name: route3
         route: routes/routes_devtest.xml
         route_id: 1
-        sweep_log: throwaway/0.75r_resaware_route3.csv
+        sweep_log: outputs/0.75r_resaware_route3.csv
 
   - name: resaware_multires_0.05to0.1
     script: test_wor_multires.py
@@ -135,26 +163,26 @@ experiments:
       - "0.1"
       - --traffic-light-distance
       - "5.0"
-    latencies: [0.05]
+    latencies: [0.2, 0.15, 0.1, 0.05]
     vehicle_densities: [0, 5, 20]
     pedestrian_densities: [0, 10, 40]
     routes:
       - name: route0
         route: routes/routes_training.xml
         route_id: 0
-        sweep_log: throwaway/0.05to0.1r_resaware_route0.csv
+        sweep_log: outputs/0.05to0.1r_resaware_route0.csv
       - name: route1
         route: routes/routes_training.xml
         route_id: 1
-        sweep_log: throwaway/0.05to0.1r_resaware_route1.csv
+        sweep_log: outputs/0.05to0.1r_resaware_route1.csv
       - name: route2
         route: routes/routes_devtest.xml
         route_id: 0
-        sweep_log: throwaway/0.05to0.1r_resaware_route2.csv
+        sweep_log: outputs/0.05to0.1r_resaware_route2.csv
       - name: route3
         route: routes/routes_devtest.xml
         route_id: 1
-        sweep_log: throwaway/0.05to0.1r_resaware_route3.csv
+        sweep_log: outputs/0.05to0.1r_resaware_route3.csv
   
   - name: resaware_multires_0.1to0.15
     script: test_wor_multires.py
@@ -176,24 +204,24 @@ experiments:
       - "0.15"
       - --traffic-light-distance
       - "5.0"
-    latencies: [0.1]
+    latencies: [0.2, 0.15, 0.1, 0.05]
     vehicle_densities: [0, 5, 20]
     pedestrian_densities: [0, 10, 40]
     routes:
       - name: route0
         route: routes/routes_training.xml
         route_id: 0
-        sweep_log: throwaway/0.1to0.15r_resaware_route0.csv
+        sweep_log: outputs/0.1to0.15r_resaware_route0.csv
       - name: route1
         route: routes/routes_training.xml
         route_id: 1
-        sweep_log: throwaway/0.1to0.15r_resaware_route1.csv
+        sweep_log: outputs/0.1to0.15r_resaware_route1.csv
       - name: route2
         route: routes/routes_devtest.xml
         route_id: 0
-        sweep_log: throwaway/0.1to0.15r_resaware_route2.csv
+        sweep_log: outputs/0.1to0.15r_resaware_route2.csv
       - name: route3
         route: routes/routes_devtest.xml
         route_id: 1
-        sweep_log: throwaway/0.1to0.15r_resaware_route3.csv
+        sweep_log: outputs/0.1to0.15r_resaware_route3.csv
     

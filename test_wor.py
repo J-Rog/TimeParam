@@ -851,10 +851,11 @@ def _clone_control(control):
 
 def run_configuration(args, client, world, tm_port, route_xml, preview_config,
                       control_latency, vehicle_density, pedestrian_density):
-    if control_latency <= 0:
-        raise ValueError("Control latency must be positive")
+    if control_latency < 0:
+        raise ValueError("Control latency must be non-negative")
 
     FIXED_DT = 0.025
+    MIN_CONTROL_PERIOD = 0.05
     STUCK_SPEED_THRESHOLD = 0.2  # m/s
     STUCK_TIME_SECONDS = 8.0
     MAX_LOW_SPEED_SECONDS = 40.0
@@ -862,9 +863,22 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
     _apply_route_weather(world, preview_config)
     tm = client.get_trafficmanager(tm_port)
 
-    latency_steps = max(1, int(round(control_latency / FIXED_DT)))
+    if control_latency >= MIN_CONTROL_PERIOD:
+        latency_steps = max(1, int(round(control_latency / FIXED_DT)))
+        control_period_steps = latency_steps
+    else:
+        latency_steps = 0
+        control_period_steps = max(1, int(round(MIN_CONTROL_PERIOD / FIXED_DT)))
+
     effective_control_latency = latency_steps * FIXED_DT
-    if abs(effective_control_latency - control_latency) > 1e-6:
+    effective_control_period = control_period_steps * FIXED_DT
+
+    if control_latency == 0:
+        print(
+            f"Using zero-latency mode with control period {effective_control_period:.3f}s "
+            f"(steps={control_period_steps})."
+        )
+    elif abs(effective_control_latency - control_latency) > 1e-6:
         print(
             f"Requested control latency {control_latency:.3f}s rounded to "
             f"{effective_control_latency:.3f}s (steps={latency_steps})."
@@ -993,7 +1007,11 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
         low_speed_frames = 0
         pending_control = _clone_control(pcla.get_action())
         applied_control = carla.VehicleControl()
-        next_apply_tick = latency_steps
+        if latency_steps == 0:
+            applied_control = _clone_control(pending_control)
+            next_apply_tick = control_period_steps
+        else:
+            next_apply_tick = latency_steps
         sim_ticks = 0
         terminal_message = ""
 
@@ -1097,7 +1115,7 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
             if sim_ticks >= next_apply_tick:
                 applied_control = _clone_control(pending_control)
                 pending_control = _clone_control(pcla.get_action())
-                next_apply_tick = sim_ticks + latency_steps
+                next_apply_tick = sim_ticks + control_period_steps
 
             ego.apply_control(applied_control)
 
@@ -1162,9 +1180,9 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
         'route_id': scorer.route_id,
         'route_xml': route_xml,
         'agent': args.agent,
-        'control_period': float(control_latency),
-        'control_latency': float(control_latency),
-        'control_steps': latency_steps,
+        'control_period': float(effective_control_period),
+        'control_latency': float(effective_control_latency),
+        'control_steps': control_period_steps,
         'latency_steps': latency_steps,
         'vehicle_density': vehicle_density,
         'pedestrian_density': pedestrian_density,
@@ -1220,8 +1238,8 @@ def main():
     pedestrian_counts = args.sweep_pedestrian_density or [args.pedestrian_density]
     control_latencies = args.sweep_control_latencies or [args.control_latency]
 
-    if any(lat <= 0 for lat in control_latencies):
-        raise ValueError("All control latencies must be positive")
+    if any(lat < 0 for lat in control_latencies):
+        raise ValueError("All control latencies must be non-negative")
 
     def _build_density_pairs(vehicles, pedestrians):
         vehicle_sweep = bool(args.sweep_vehicle_density)
