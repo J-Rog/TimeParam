@@ -11,7 +11,7 @@ def aggregate_logs_from_filenames(base_dir: str = ".", routes=(0, 1)):
     e.g., '0.75r_route0.csv', '1.0r_route1.csv'
     """
     #(?:_resaware)?
-    pattern = re.compile(r"(?P<resolution>[0-9.]+)r_route(?P<route_id>\d+)\.csv$")
+    pattern = re.compile(r"(?P<resolution>[0-9.]+)r_resaware_route(?P<route_id>\d+)\.csv$")
     dfs = []
 
     for p in Path(base_dir).rglob("*.csv"):
@@ -141,7 +141,41 @@ def aggregate_logs_from_filenames(base_dir: str = ".", routes=(0, 1)):
         .round(2)
     )
 
-    # ---- 3. Failures ----
+    # ---- 3. Environment density effects ----
+    density_group_cols = ["vehicle_density","pedestrian_density"]
+    if "resolution" in df.columns:
+        density_group_cols.append("resolution")
+
+    agg_density = (
+        df.groupby(density_group_cols)
+        .agg(
+            runs=("status","count"),
+            success_rate=("success","mean"),
+            collision_rate=("any_collision","mean"),
+            vehicle_collision_rate=("vehicle_collision_flag","mean"),
+            ped_collision_rate=("ped_collision_flag","mean"),
+            static_collision_rate=("static_collision_flag","mean"),
+            mean_completion=("route_completion","mean"),
+            mean_lane_crossings=("lane_crossings","mean"),
+            median_lane_crossings=("lane_crossings","median")
+        )
+        .reset_index()
+        .sort_values(density_group_cols)
+    )
+    density_rate_cols = [
+        "success_rate",
+        "collision_rate",
+        "vehicle_collision_rate",
+        "ped_collision_rate",
+        "static_collision_rate"
+    ]
+    for col in density_rate_cols:
+        agg_density[col] = (100 * agg_density[col]).round(1)
+    agg_density["mean_completion"] = agg_density["mean_completion"].round(2)
+    agg_density["mean_lane_crossings"] = agg_density["mean_lane_crossings"].round(2)
+    agg_density["median_lane_crossings"] = agg_density["median_lane_crossings"].round(2)
+
+    # ---- 4. Failures ----
     failures = (
         df[df["status"] != "completed"]
         .groupby([
@@ -156,7 +190,7 @@ def aggregate_logs_from_filenames(base_dir: str = ".", routes=(0, 1)):
         .reset_index(name="count")
     )
 
-    # ---- 4. By route ----
+    # ---- 5. By route ----
     agg_by_route = (
         df.groupby(["resolution","route_id","control_period_rounded","control_latency_rounded"])
         .agg(
@@ -178,6 +212,9 @@ def aggregate_logs_from_filenames(base_dir: str = ".", routes=(0, 1)):
     print("\n=== Success and safety by resolution × control period × control latency ===")
     print(agg_res_cp.to_string(index=False))
 
+    print("\n=== Effects of environment density ===")
+    print(agg_density.to_string(index=False))
+
     print("\n=== Failures (non-completions) ===")
     print(failures.to_string(index=False))
 
@@ -190,6 +227,7 @@ def aggregate_logs_from_filenames(base_dir: str = ".", routes=(0, 1)):
 
     agg_by_res.to_csv(out_dir / "summary_by_resolution.csv", index=False)
     agg_res_cp.to_csv(out_dir / "success_by_resolution_control.csv", index=False)
+    agg_density.to_csv(out_dir / "by_density.csv", index=False)
     failures.to_csv(out_dir / "failures.csv", index=False)
     agg_by_route.to_csv(out_dir / "by_route.csv", index=False)
 
@@ -198,10 +236,11 @@ def aggregate_logs_from_filenames(base_dir: str = ".", routes=(0, 1)):
     return {
         "by_resolution": agg_by_res,
         "by_resolution_cp": agg_res_cp,
+        "by_density": agg_density,
         "failures": failures,
         "by_route": agg_by_route
     }
 
 
 # Example usage:
-results = aggregate_logs_from_filenames("", routes=(2, 3))
+results = aggregate_logs_from_filenames("", routes=(0, 1))

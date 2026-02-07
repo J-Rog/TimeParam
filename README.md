@@ -32,10 +32,10 @@ python test_wor.py
 Common options:
 - `--agent wor_nc` or `--agent wor_lb`
 - `--route path/to/route.xml`
-- `--town Town05`
-- `--vehicle-density 20 --pedestrian-density 50`
-- `--control-latency 0.05`
+- `--route-id 0`
+- `--agent-config path/to/config.yaml`
 - `--sweep-control-latencies 0.05 0.1 --sweep-log outputs/sweeps.csv`
+- `--sweep-vehicle-density 0 5 20 --sweep-pedestrian-density 0 10 40`
 
 See `python test_wor.py --help` for the full list.
 

@@ -19,11 +19,7 @@ except ImportError:
 
 from PCLA import PCLA
 from leaderboard_codes.route_indexer import RouteIndexer as LegacyRouteIndexer
-from leaderboard_codes.route_manipulation import (
-    interpolate_trajectory,
-    _get_latlon_ref,
-    _location_to_gps,
-)
+from leaderboard_codes.route_manipulation import interpolate_trajectory
 
 # Allow importing the Leaderboard/scenario_runner utilities that ship in WorldOnRails
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +50,10 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 DEFAULT_TM_PORT = 8000
+# Defaults used when no sweep values are provided.
+DEFAULT_CONTROL_LATENCY = 0.10
+DEFAULT_VEHICLE_DENSITY = 20
+DEFAULT_PEDESTRIAN_DENSITY = 50
 
 
 class _CriterionBucket:
@@ -455,8 +455,10 @@ class ResolutionProfile:
 
     @classmethod
     def build(cls, name, wide_scale, narr_scale, latency_seconds, fixed_dt):
-        if latency_seconds <= 0:
-            raise ValueError(f"Latency for profile '{name}' must be positive")
+        if latency_seconds < 0:
+            raise ValueError(f"Latency for profile '{name}' must be non-negative")
+        if latency_seconds == 0:
+            return cls(name, wide_scale, narr_scale, 0.0, 0)
         steps = max(1, int(round(latency_seconds / fixed_dt)))
         actual_latency = steps * fixed_dt
         return cls(name, wide_scale, narr_scale, actual_latency, steps)
@@ -671,42 +673,10 @@ def parse_args():
         help="Agent identifier recognized by PCLA (default: wor_nc).",
     )
     parser.add_argument(
-        "--town",
-        help="Override the town to load. If omitted, uses the 'town' attribute inside the route XML.",
-    )
-    parser.add_argument(
-        "--draw-route",
-        action="store_true",
-        help="Draw the dense route on the CARLA viewport for visualization.",
-    )
-    parser.add_argument(
-        "--debug-gps",
-        action="store_true",
-        help="Print GNSS readings vs. route GPS (converted from x,y,z) to debug mismatches.",
-    )
-    parser.add_argument(
-        "--control-latency",
-        type=float,
-        default=0.10,
-        help="Lane-following control latency in seconds (default mirrors 100 ms).",
-    )
-    parser.add_argument(
         "--traffic-light-latency",
         type=float,
         default=0.15,
         help="Control latency (seconds) for the high-resolution profile near traffic lights.",
-    )
-    parser.add_argument(
-        "--vehicle-density",
-        type=int,
-        default=20,
-        help="Number of TrafficManager vehicles to keep active (density proxy).",
-    )
-    parser.add_argument(
-        "--pedestrian-density",
-        type=int,
-        default=50,
-        help="Number of pedestrians to spawn (density proxy).",
     )
     parser.add_argument(
         "--sweep-control-latencies",
@@ -718,23 +688,18 @@ def parse_args():
         "--sweep-vehicle-density",
         type=int,
         nargs="+",
-        help="Vehicle density values to sweep (overrides --vehicle-density).",
+        help="Vehicle density values to sweep.",
     )
     parser.add_argument(
         "--sweep-pedestrian-density",
         type=int,
         nargs="+",
-        help="Pedestrian density values to sweep (overrides --pedestrian-density).",
+        help="Pedestrian density values to sweep.",
     )
     parser.add_argument(
         "--sweep-log",
         type=str,
         help="Optional CSV path for logging sweep results (rows appended).",
-    )
-    parser.add_argument(
-        "--reload-world-between-runs",
-        action="store_true",
-        help="Reload the CARLA world before each sweep run instead of reusing the previous one.",
     )
     parser.add_argument(
         "--agent-config",
@@ -746,11 +711,6 @@ def parse_args():
         type=float,
         default=5.0,
         help="Distance (m) to a stop line that triggers the traffic-light profile.",
-    )
-    parser.add_argument(
-        "--traffic-light-release-distance",
-        type=float,
-        help="Distance (m) from the light trigger to drop back to the lane profile (default: trigger distance + 2m).",
     )
     parser.add_argument(
         "--lane-wide-scale",
@@ -973,15 +933,6 @@ def destroy(actors):
         pass
 
 
-def draw_route_debug(world, dense_route, step=5):
-    color = carla.Color(0, 191, 255)
-    for idx, (transform, _) in enumerate(dense_route):
-        if idx % step != 0:
-            continue
-        loc = transform.location + carla.Location(z=0.3)
-        world.debug.draw_point(loc, size=0.1, color=color, life_time=0.0, persistent_lines=True)
-
-
 def destroy_sensors(sensors):
     for sensor in sensors:
         if not sensor:
@@ -1064,8 +1015,8 @@ def _clone_control(control):
 
 def run_configuration(args, client, world, tm_port, route_xml, preview_config,
                       control_latency, vehicle_density, pedestrian_density):
-    if control_latency <= 0:
-        raise ValueError("Control latency must be positive")
+    if control_latency < 0:
+        raise ValueError("Control latency must be non-negative")
 
     FIXED_DT = 0.025
     STUCK_SPEED_THRESHOLD = 0.2  # m/s
@@ -1103,13 +1054,6 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
         )
 
     dense_route_preview = interpolate_trajectory(world, preview_config.trajectory)[1]
-    lat_ref, lon_ref = _get_latlon_ref(world)
-    dense_route_gps = [
-        _location_to_gps(lat_ref, lon_ref, transform.location)
-        for transform, _ in dense_route_preview
-    ]
-    if args.draw_route:
-        draw_route_debug(world, dense_route_preview)
 
     make_sync(world, tm, fixed_dt=FIXED_DT)
 
@@ -1196,7 +1140,6 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
         mode_manager = TrafficLightModeManager(
             scorer,
             activation_distance=args.traffic_light_distance,
-            release_distance=args.traffic_light_release_distance,
         )
         multires_controller = MultiResolutionController(pcla, lane_profile, traffic_profile)
         current_mode = "lane"
@@ -1218,20 +1161,6 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
         lane_sensor.listen(scorer.on_lane_invasion)
         aux_sensors.append(lane_sensor)
 
-        latest_gnss = {'lat': None, 'lon': None, 'alt': None}
-        if args.debug_gps:
-            gnss_bp = bp_lib.find('sensor.other.gnss')
-            gnss_bp.set_attribute('sensor_tick', f"{FIXED_DT}")
-            gnss_sensor = world.spawn_actor(gnss_bp, carla.Transform(), attach_to=ego)
-
-            def _debug_gnss_cb(measurement):
-                latest_gnss['lat'] = measurement.latitude
-                latest_gnss['lon'] = measurement.longitude
-                latest_gnss['alt'] = measurement.altitude
-
-            gnss_sensor.listen(_debug_gnss_cb)
-            aux_sensors.append(gnss_sensor)
-
         print(
             f"Spawned ego and {len(vehicles)} vehicles, {len(walkers)} walkers "
             f"(targets {vehicle_density}/{pedestrian_density})."
@@ -1242,11 +1171,18 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
         latency_steps = current_profile.latency_steps
         pending_control = _clone_control(pcla.get_action())
         applied_control = carla.VehicleControl()
+        if latency_steps == 0:
+            applied_control = _clone_control(pending_control)
         next_apply_tick = latency_steps
         sim_ticks = 0
         terminal_message = ""
 
         while True:
+            apply_before_tick = latency_steps == 0
+            if apply_before_tick:
+                # Zero-latency path: apply the most recent control before stepping the world.
+                ego.apply_control(applied_control)
+
             world.tick()
             sim_ticks += 1
             monitor = getattr(world, "_tm_monitor", None)
@@ -1324,36 +1260,11 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
                 print(f"Route completed in {sim_t:.1f}s (sim) / {wall_t:.1f}s (wall).")
                 break
 
-            if args.debug_gps and dense_route_gps:
-                route_idx = min(scorer.route_tracker.current_index, len(dense_route_gps) - 1)
-                route_gps = dense_route_gps[route_idx]
-                route_loc = dense_route_preview[route_idx][0].location
-                if latest_gnss['lat'] is None:
-                    vehicle_gps = _location_to_gps(lat_ref, lon_ref, ego.get_transform().location)
-                else:
-                    vehicle_gps = latest_gnss.copy()
-                vehicle_alt = vehicle_gps.get('alt', vehicle_gps.get('z', 0.0))
-                separation = ego.get_transform().location.distance(route_loc)
-                print(
-                    "[GPS DEBUG] frame {frame} | veh lat={lat:.7f} lon={lon:.7f} alt={alt:.2f} | route idx={idx} lat={r_lat:.7f} lon={r_lon:.7f} alt={r_alt:.2f} | dist_m={dist:.2f}".format(
-                        frame=frame,
-                        lat=vehicle_gps['lat'],
-                        lon=vehicle_gps['lon'],
-                        alt=vehicle_alt,
-                        idx=route_idx,
-                        r_lat=route_gps['lat'],
-                        r_lon=route_gps['lon'],
-                        r_alt=route_gps['z'],
-                        dist=separation,
-                    )
-                )
-
             if random.random() < 0.02:
                 for controller in walker_controllers:
                     controller.go_to_location(world.get_random_location_from_navigation())
 
             if sim_ticks >= next_apply_tick:
-                applied_control = _clone_control(pending_control)
                 if mode_manager and multires_controller:
                     mode, _ = mode_manager.update(ego)
                     current_mode = mode
@@ -1363,10 +1274,18 @@ def run_configuration(args, client, world, tm_port, route_xml, preview_config,
                     current_mode = "lane"
                     latency_steps = lane_profile.latency_steps
                     current_profile = lane_profile
-                pending_control = _clone_control(pcla.get_action())
+                if latency_steps == 0:
+                    # Zero-latency: sample now so it is applied on the next tick.
+                    pending_control = _clone_control(pcla.get_action())
+                    applied_control = _clone_control(pending_control)
+                else:
+                    applied_control = _clone_control(pending_control)
+                    pending_control = _clone_control(pcla.get_action())
                 next_apply_tick = sim_ticks + latency_steps
 
-            ego.apply_control(applied_control)
+            if not apply_before_tick:
+                # Non-zero latency: apply after the tick to model the delay.
+                ego.apply_control(applied_control)
 
         status = "completed" if scorer.completed_event_sent else "aborted"
         message = terminal_message or ("route_completed" if status == "completed" else "manual_stop")
@@ -1476,17 +1395,10 @@ def main():
         args.agent_config = os.path.abspath(args.agent_config)
         if not os.path.isfile(args.agent_config):
             raise FileNotFoundError(f"Agent config override {args.agent_config} not found")
-    if args.control_latency < 0:
-        raise ValueError("Control latency must be non-negative")
-    if args.traffic_light_latency <= 0:
-        raise ValueError("Traffic-light latency must be positive")
+    if args.traffic_light_latency < 0:
+        raise ValueError("Traffic-light latency must be non-negative")
     if args.traffic_light_distance <= 0:
         raise ValueError("Traffic-light trigger distance must be positive")
-    if (
-        args.traffic_light_release_distance is not None
-        and args.traffic_light_release_distance <= args.traffic_light_distance
-    ):
-        raise ValueError("--traffic-light-release-distance must be greater than --traffic-light-distance.")
 
     scenario_json = os.path.join(CURRENT_DIR, "leaderboard_codes", "no_scenarios.json")
     preview_indexer = LegacyRouteIndexer(route_xml, scenario_json, 1)
@@ -1494,20 +1406,20 @@ def main():
     if not preview_config or not getattr(preview_config, "trajectory", None):
         raise RuntimeError(f"Route file {route_xml} does not contain any waypoints")
 
-    route_town = args.town or getattr(preview_config, "town", None)
+    route_town = getattr(preview_config, "town", None)
     if not route_town or route_town == "_":
-        raise RuntimeError("Route file does not specify a town. Use --town to select the CARLA map.")
+        raise RuntimeError("Route file does not specify a town.")
 
     client = carla.Client('localhost', 2000)
     client.set_timeout(10.0)
     tm_port = DEFAULT_TM_PORT
 
-    vehicle_counts = args.sweep_vehicle_density or [args.vehicle_density]
-    pedestrian_counts = args.sweep_pedestrian_density or [args.pedestrian_density]
-    control_latencies = args.sweep_control_latencies or [args.control_latency]
+    vehicle_counts = args.sweep_vehicle_density or [DEFAULT_VEHICLE_DENSITY]
+    pedestrian_counts = args.sweep_pedestrian_density or [DEFAULT_PEDESTRIAN_DENSITY]
+    control_latencies = args.sweep_control_latencies or [DEFAULT_CONTROL_LATENCY]
 
-    if any(lat <= 0 for lat in control_latencies):
-        raise ValueError("All control latencies must be positive")
+    if any(lat < 0 for lat in control_latencies):
+        raise ValueError("All control latencies must be non-negative")
 
     def _build_density_pairs(vehicles, pedestrians):
         vehicle_sweep = bool(args.sweep_vehicle_density)
@@ -1551,14 +1463,11 @@ def main():
             if idx == 1:
                 current_world = world
             else:
-                if args.reload_world_between_runs:
-                    current_world = _load_world_and_wait(client, route_town)
-                else:
-                    current_world = client.get_world()
-                    try:
-                        current_world.wait_for_tick()
-                    except RuntimeError:
-                        time.sleep(0.1)
+                current_world = client.get_world()
+                try:
+                    current_world.wait_for_tick()
+                except RuntimeError:
+                    time.sleep(0.1)
 
             try:
                 result = run_configuration(
@@ -1577,11 +1486,10 @@ def main():
                 raise
             except Exception as exc:
                 print(f"Configuration failed: {exc}")
-                if not args.reload_world_between_runs:
-                    try:
-                        world = _load_world_and_wait(client, route_town)
-                    except Exception as reload_exc:
-                        print(f"Failed to reload world after error: {reload_exc}")
+                try:
+                    world = _load_world_and_wait(client, route_town)
+                except Exception as reload_exc:
+                    print(f"Failed to reload world after error: {reload_exc}")
                 sweep_logger.log({
                     'timestamp': datetime.utcnow().isoformat(),
                     'route_id': route_fallback_id,

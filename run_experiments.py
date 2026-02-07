@@ -90,23 +90,14 @@ def run_single_experiment(run_name, cfg, dry_run, script_path):
     )
     if control_latencies:
         extend_flag(cmd, "--sweep-control-latencies", control_latencies)
-    elif cfg.get("control_latency") is not None:
-        extend_flag(cmd, "--control-latency", cfg["control_latency"])
 
     vehicle_densities = cfg.get("sweep_vehicle_density", cfg.get("vehicle_densities"))
     if vehicle_densities:
         extend_flag(cmd, "--sweep-vehicle-density", vehicle_densities)
-    elif cfg.get("vehicle_density") is not None:
-        extend_flag(cmd, "--vehicle-density", cfg["vehicle_density"])
 
     pedestrian_densities = cfg.get("sweep_pedestrian_density", cfg.get("pedestrian_densities"))
     if pedestrian_densities:
         extend_flag(cmd, "--sweep-pedestrian-density", pedestrian_densities)
-    elif cfg.get("pedestrian_density") is not None:
-        extend_flag(cmd, "--pedestrian-density", cfg["pedestrian_density"])
-
-    if cfg.get("reload_world_between_runs"):
-        cmd.append("--reload-world-between-runs")
 
     extra_args = cfg.get("extra_args", [])
     if extra_args:
