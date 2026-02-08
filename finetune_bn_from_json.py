@@ -7,17 +7,23 @@ resolutions without disturbing the policy head.
 """
 
 import os
-import json
 import math
 import yaml
-import cv2
-import numpy as np
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Subset
 
+from finetune_common import (
+    _forward_with_features,
+    _load_balanced_cache,
+    _resize_images,
+    _resize_labels,
+    _save_balanced_cache,
+    enable_backbone_bn_training,
+    spd_lerp,
+)
 from pcla_agents.wor.rails.models import CameraModel
 from pcla_agents.wor.rails.datasets.json_main_dataset import JSONLabeledMainDataset
 
@@ -26,7 +32,8 @@ from pcla_agents.wor.rails.datasets.json_main_dataset import JSONLabeledMainData
 # Editable hyper-parameters
 ###############################
 CONFIG_PATH = "pcla_agents/wor_pretrained/nocrash_weights/config_nocrash.yaml"
-DATA_DIR = "/media/q350w358/WD Drive/rails1M/main_trajs6_converted2"
+DEFAULT_DATA_DIR = "data/main_trajs_converted"
+DATA_DIR = os.environ.get("WOR_DATA_DIR", DEFAULT_DATA_DIR)
 CHECKPOINT_PATH = "pcla_agents/wor_pretrained/nocrash_weights/main_model_16.th"
 TEACHER_CHECKPOINT = CHECKPOINT_PATH  # path to frozen teacher weights
 
@@ -34,10 +41,10 @@ DEVICE = "cuda"
 BATCH_SIZE = 128
 NUM_WORKERS = 8
 EPOCHS = 2
-LEARNING_RATE = 5e-5
+LEARNING_RATE = 1.5e-4
 USE_AUGMENT = True  # imgaug jittering on RGBs
-WIDE_SCALE = 0.75
-NARR_SCALE = 0.75
+WIDE_SCALE = 1.0
+NARR_SCALE = 1.0
 TRAIN_BACKBONE = True
 TRAIN_BACKBONE_BN = True
 BACKBONE_UNFREEZE_SCHEDULE = [
@@ -54,74 +61,13 @@ CALIBRATION_MAX_BATCHES = 200  # set to None to sweep the entire subset
 USE_BALANCED_SAMPLING = True   # attempt to balance command distribution when subsampling
 TEACHER_KL_WEIGHT = 1.0
 TEACHER_FEAT_WEIGHT = 1.0
-OUTPUT_PATH = "outputs/bn_"+str(WIDE_SCALE)+"r_no_mlp_hres_teacher.th"
+OUTPUT_PATH = "outputs/bn_"+str(WIDE_SCALE)+"r.th"
 BALANCED_CACHE_PATH = "outputs/balanced_indices.json"
 
 SAMPLE_SIZE = 50000  # set to None to use all frames
 SAMPLE_SEED = 0
 MAX_STEPS = None  # set to an int to cap optimizer steps
 ###############################
-
-
-def enable_backbone_bn_training(
-    model,
-    train_backbone=True,
-    train_backbone_bn=True,
-    backbone_unfreeze_stage=None,
-    train_bottleneck=True,
-    train_seg_heads=True,
-    train_act_head=False,
-):
-    """
-    Freeze most of the network, optionally enabling specific regions to train.
-    """
-    for param in model.parameters():
-        param.requires_grad = False
-
-    trainable = []
-    stages = ["layer1", "layer2", "layer3", "layer4"]
-
-    def should_train_backbone(sub_name):
-        if not train_backbone:
-            return False
-        if backbone_unfreeze_stage is None:
-            return True
-        if backbone_unfreeze_stage not in stages:
-            raise ValueError(f"Invalid backbone stage {backbone_unfreeze_stage}")
-        target_idx = stages.index(backbone_unfreeze_stage)
-        for stage in stages[target_idx:]:
-            if sub_name.startswith(stage):
-                return True
-        return False
-
-    for name, module in model.named_modules():
-        if name.startswith("backbone_wide") or name.startswith("backbone_narr"):
-            suffix = name.split(".", 1)[-1] if "." in name else ""
-            if should_train_backbone(suffix):
-                if not train_backbone_bn and isinstance(module, (nn.BatchNorm2d, nn.SyncBatchNorm)):
-                    for param in module.parameters():
-                        param.requires_grad = False
-                    continue
-                for param in module.parameters():
-                    param.requires_grad = True
-                    trainable.append(param)
-        elif train_bottleneck and name.startswith("bottleneck"):
-            for param in module.parameters():
-                param.requires_grad = True
-                trainable.append(param)
-        elif train_seg_heads and name.startswith("seg_head"):
-            for param in module.parameters():
-                param.requires_grad = True
-                trainable.append(param)
-        elif train_act_head and name.startswith("act_head"):
-            for param in module.parameters():
-                param.requires_grad = True
-                trainable.append(param)
-
-    if not trainable:
-        raise RuntimeError("No parameters were marked trainable. Check the model structure.")
-
-    return trainable
 
 
 def calibrate_batch_norm(model, dataset, cfg, device, max_batches=None):
@@ -184,154 +130,6 @@ def _forward_for_bn(model, batch, cfg, device):
         wide_rgbs,
         narr_rgbs,
         spd=None if cfg["all_speeds"] else spds,
-    )
-
-
-def _load_balanced_cache(expected_len):
-    if not BALANCED_CACHE_PATH or not os.path.isfile(BALANCED_CACHE_PATH):
-        return None
-    try:
-        with open(BALANCED_CACHE_PATH, "r") as f:
-            payload = json.load(f)
-    except Exception:
-        return None
-
-    if payload.get("dataset_len") != expected_len:
-        return None
-    if payload.get("sample_size") != SAMPLE_SIZE:
-        return None
-    if payload.get("seed") != SAMPLE_SEED:
-        return None
-    if payload.get("data_dir") != os.path.abspath(DATA_DIR):
-        return None
-    if payload.get("config_path") != os.path.abspath(CONFIG_PATH):
-        return None
-
-    indices = payload.get("indices")
-    if not isinstance(indices, list):
-        return None
-    return indices
-
-
-def _save_balanced_cache(indices, dataset_len):
-    if not BALANCED_CACHE_PATH:
-        return
-    payload = {
-        "dataset_len": dataset_len,
-        "sample_size": SAMPLE_SIZE,
-        "seed": SAMPLE_SEED,
-        "data_dir": os.path.abspath(DATA_DIR),
-        "config_path": os.path.abspath(CONFIG_PATH),
-        "indices": indices,
-    }
-    os.makedirs(os.path.dirname(BALANCED_CACHE_PATH), exist_ok=True)
-    with open(BALANCED_CACHE_PATH, "w") as f:
-        json.dump(payload, f)
-
-
-def _to_numpy_batch(batch):
-    if batch is None:
-        return None
-    if isinstance(batch, torch.Tensor):
-        return batch.detach().cpu().numpy()
-    return batch
-
-
-def _resize_images(batch, scale):
-    if batch is None or abs(scale - 1.0) < 1e-6:
-        return batch
-    np_batch = _to_numpy_batch(batch)
-    resized = [
-        cv2.resize(
-            img,
-            (int(round(img.shape[1] * scale)), int(round(img.shape[0] * scale))),
-            interpolation=cv2.INTER_AREA,
-        )
-        for img in np_batch
-    ]
-    return np.stack(resized, axis=0)
-
-
-def _resize_labels(batch, scale):
-    if batch is None or abs(scale - 1.0) < 1e-6:
-        return batch
-    np_batch = _to_numpy_batch(batch)
-    resized = [
-        cv2.resize(
-            lbl,
-            (int(round(lbl.shape[1] * scale)), int(round(lbl.shape[0] * scale))),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        for lbl in np_batch
-    ]
-    return np.stack(resized, axis=0)
-
-
-def spd_lerp(v, x, min_val, max_val):
-    """
-    Vectorized version of RAILS.spd_lerp to interpolate over the speed dimension.
-    v: (B, num_cmds, num_speeds, num_actions)
-    x: (B,) tensor of speeds
-    """
-    D = v.shape[2]
-    x = (x - min_val) / (max_val - min_val + 1e-8) * (D - 1)
-
-    x0 = torch.floor(x).long().clamp(min=0, max=D - 1)
-    x1 = torch.ceil(x).long().clamp(min=0, max=D - 1)
-    w = (x - x0.float()).unsqueeze(-1).unsqueeze(-1)
-
-    gather_shape = (v.shape[0], v.shape[1], 1, v.shape[3])
-    idx0 = x0.view(v.shape[0], 1, 1, 1).expand(gather_shape)
-    idx1 = x1.view(v.shape[0], 1, 1, 1).expand(gather_shape)
-
-    v0 = torch.gather(v, 2, idx0).squeeze(2)
-    v1 = torch.gather(v, 2, idx1).squeeze(2)
-    return (1 - w) * v0 + w * v1
-
-def action_logits(raw_logits, num_steers, num_throts):
-    
-    steer_logits = raw_logits[...,:num_steers]
-    throt_logits = raw_logits[...,num_steers:num_steers+num_throts]
-    brake_logits = raw_logits[...,-1:]
-    
-    steer_logits = steer_logits.repeat(1,1,1,num_throts)
-    throt_logits = throt_logits.repeat_interleave(num_steers,-1)
-    
-    act_logits = torch.cat([steer_logits + throt_logits, brake_logits], dim=-1)
-    
-    return act_logits
-    
-def _forward_with_features(model, wide_rgbs, narr_rgbs, spds, cfg):
-    wide_embed = model.backbone_wide(model.normalize(wide_rgbs / 255.0))
-    wide_seg = model.seg_head_wide(wide_embed)
-
-    if model.two_cam:
-        narr_embed = model.backbone_narr(model.normalize(narr_rgbs / 255.0))
-        narr_seg = model.seg_head_narr(narr_embed)
-        pooled = torch.cat([
-            wide_embed.mean(dim=[2, 3]),
-            model.bottleneck_narr(narr_embed.mean(dim=[2, 3])),
-        ], dim=1)
-    else:
-        narr_embed = None
-        narr_seg = None
-        pooled = wide_embed.mean(dim=[2, 3])
-
-    if cfg["all_speeds"]:
-        act = model.act_head(pooled).view(-1, model.num_cmds, model.num_speeds, model.num_steers + model.num_throts + 1)
-        act = action_logits(act, model.num_steers, model.num_throts)
-    else:
-        speed_feat = model.spd_encoder(spds[:, None])
-        act = model.act_head(torch.cat([pooled, speed_feat], dim=1)).view(-1, model.num_cmds, 1, model.num_steers + model.num_throts + 1)
-        act = action_logits(act, model.num_steers, model.num_throts).squeeze(2)
-
-    return dict(
-        act=act,
-        wide_seg=wide_seg,
-        narr_seg=narr_seg,
-        pooled=pooled,
-        wide_embed=wide_embed,
-        narr_embed=narr_embed,
     )
 
 
@@ -452,6 +250,13 @@ def main():
 
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
 
+    if not os.path.isdir(DATA_DIR):
+        raise FileNotFoundError(
+            f"DATA_DIR does not exist: {DATA_DIR}\n"
+            "Set WOR_DATA_DIR to your dataset root, e.g.\n"
+            "  export WOR_DATA_DIR='/path/to/main_trajs_converted'"
+        )
+
     with open(CONFIG_PATH, "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -473,7 +278,14 @@ def main():
         if SAMPLE_SIZE > len(train_dataset):
             raise ValueError(f"SAMPLE_SIZE {SAMPLE_SIZE} exceeds dataset length {len(train_dataset)}")
         if USE_BALANCED_SAMPLING and hasattr(train_dataset, "balanced_indices"):
-            cached_indices = _load_balanced_cache(base_dataset_len)
+            cached_indices = _load_balanced_cache(
+                BALANCED_CACHE_PATH,
+                base_dataset_len,
+                SAMPLE_SIZE,
+                SAMPLE_SEED,
+                DATA_DIR,
+                CONFIG_PATH,
+            )
             if cached_indices is not None:
                 subset_indices = cached_indices
                 print(f"Loaded {len(subset_indices)} balanced indices from cache {BALANCED_CACHE_PATH}")
@@ -482,7 +294,15 @@ def main():
                     total_count=SAMPLE_SIZE, seed=SAMPLE_SEED
                 )
                 print(f"Sampling {len(subset_indices)} balanced frames from the JSON dataset")
-                _save_balanced_cache(subset_indices, base_dataset_len)
+                _save_balanced_cache(
+                    BALANCED_CACHE_PATH,
+                    subset_indices,
+                    base_dataset_len,
+                    SAMPLE_SIZE,
+                    SAMPLE_SEED,
+                    DATA_DIR,
+                    CONFIG_PATH,
+                )
         else:
             generator = torch.Generator().manual_seed(SAMPLE_SEED)
             subset_indices = torch.randperm(len(train_dataset), generator=generator)[: SAMPLE_SIZE].tolist()

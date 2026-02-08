@@ -37,6 +37,6 @@ all_speeds: True
 ego_model_dir: ''
 ego_data_dir: ''
 resolution_aware_bn: True
-main_model_dir: 'PCLA/outputs/resaware_bn_finetuned.th'
-# main_model_dir: 'PCLA/pcla_agents/wor_pretrained/nocrash_weights/main_model_16.th'
+main_model_dir: 'outputs/resaware_bn_finetuned.th'
+# main_model_dir: 'pcla_agents/wor_pretrained/nocrash_weights/main_model_16.th'
 main_data_dir: ''

@@ -1,6 +1,13 @@
 __pycache__/
 plant_viz/
 pcla_agents/*pretrained*/
+!pcla_agents/wor_pretrained/
+pcla_agents/wor_pretrained/*
+!pcla_agents/wor_pretrained/nocrash_weights/
+pcla_agents/wor_pretrained/nocrash_weights/*
+!pcla_agents/wor_pretrained/nocrash_weights/config_nocrash.yaml
+!pcla_agents/wor_pretrained/nocrash_weights/main_model_16.th
 wandb/
 pretrained/
 eval/
+outputs/balanced_indices.json

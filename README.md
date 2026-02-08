@@ -41,6 +41,12 @@ conda env create -f environment.yml
 conda activate PCLA
 ```
 
+Set your WoR dataset root once (recommended):
+
+```bash
+export WOR_DATA_DIR="/path/to/main_trajs_converted"
+```
+
 Optional: check your PyTorch/CUDA pair:
 
 ```bash
@@ -65,6 +71,26 @@ cd dist
 python -m pip install carla-0.9.16-cp38-cp38-linux_x86_64.whl
 cd ..
 ```
+
+### 1.4 Pretrained Weights
+
+For this paper repository (WoR-focused), the required WoR nocrash files are:
+
+- `pcla_agents/wor_pretrained/nocrash_weights/config_nocrash.yaml`
+- `pcla_agents/wor_pretrained/nocrash_weights/main_model_16.th`
+
+If you need the full original PCLA pretrained package (all supported agents), use one of the following:
+
+Option 1: Automatic download
+
+```bash
+python pcla_functions/download_weights.py
+```
+
+Option 2: Manual download
+
+1. Download `pretrained.zip` from: https://huggingface.co/datasets/MasoudJTehrani/PCLA/blob/main/pretrained.zip
+2. Extract it into `pcla_agents/` (so the pretrained folders land under `pcla_agents/`).
 
 ## 2. Run Evaluation (WoR)
 
@@ -108,7 +134,7 @@ For fine-tuning, use the WoR Rails dataset (converted from lmdb):
 
 - Download: https://utexas.box.com/s/vuf439jafqvi8u4rc37sdx9xvbrn59z2
 - Data format: per-trajectory folders with `data.json` and sensor files (RGB/semantic labels).
-- In this repo, point `DATA_DIR` in `finetune_bn_from_json.py` and `finetune_resaware_from_json.py` to the dataset root.
+- Set `WOR_DATA_DIR` to the dataset root (or place the data at `data/main_trajs_converted`).
 
 ## 4. Run Paper Fine-Tuning
 
@@ -119,7 +145,7 @@ The two paper training scripts are:
 
 Before running, edit script-level config values (at the top of each file), especially:
 
-- `DATA_DIR`
+- `WOR_DATA_DIR` (environment variable)
 - `CONFIG_PATH`
 - `CHECKPOINT_PATH`
 - `OUTPUT_PATH`

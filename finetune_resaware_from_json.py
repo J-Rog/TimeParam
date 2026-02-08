@@ -2,17 +2,23 @@
 """Fine-tune CameraModel with resolution-aware BatchNorm on multi-resolution data."""
 
 import os
-import json
 import math
 import yaml
-import cv2
-import numpy as np
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Subset
 
+from finetune_common import (
+    _forward_with_features,
+    _load_balanced_cache,
+    _resize_images,
+    _resize_labels,
+    _save_balanced_cache,
+    enable_backbone_bn_training,
+    spd_lerp,
+)
 from pcla_agents.wor.rails.models import CameraModel
 from pcla_agents.wor.rails.models.resaware_bn import (
     ResolutionAwareBatchNorm2d,
@@ -26,7 +32,8 @@ from pcla_agents.wor.rails.datasets.json_main_dataset import JSONLabeledMainData
 # Editable hyper-parameters
 ###############################
 CONFIG_PATH = "pcla_agents/wor_pretrained/nocrash_weights/config_nocrash.yaml"
-DATA_DIR = "/media/q350w358/WD Drive/rails1M/main_trajs6_converted2"
+DEFAULT_DATA_DIR = "data/main_trajs_converted"
+DATA_DIR = os.environ.get("WOR_DATA_DIR", DEFAULT_DATA_DIR)
 CHECKPOINT_PATH = "pcla_agents/wor_pretrained/nocrash_weights/main_model_16.th"
 TEACHER_CHECKPOINT = CHECKPOINT_PATH
 OUTPUT_PATH = "outputs/resaware_bn_finetuned.th"
@@ -35,7 +42,7 @@ DEVICE = "cuda"
 BATCH_SIZE = 128
 NUM_WORKERS = 8
 EPOCHS = 2
-LEARNING_RATE = 5e-5
+LEARNING_RATE = 1.5e-4
 USE_AUGMENT = True
 WIDE_SCALE = 1.0
 NARR_SCALE = 1.0
@@ -93,62 +100,24 @@ def _load_checkpoint(path, device):
     return payload, {}
 
 
-def enable_backbone_bn_training(
-    model,
-    train_backbone=True,
-    train_backbone_bn=True,
-    backbone_unfreeze_stage=None,
-    train_bottleneck=True,
-    train_seg_heads=True,
-    train_act_head=False,
-):
-    for param in model.parameters():
-        param.requires_grad = False
+def _adapt_state_dict_for_resaware(state_dict):
+    """
+    Make plain BN checkpoints load cleanly into ResolutionAwareBatchNorm2d modules.
+    """
+    if state_dict_has_resaware_stats(state_dict):
+        return state_dict
 
-    trainable = []
-    stages = ["layer1", "layer2", "layer3", "layer4"]
-
-    def should_train_backbone(sub_name):
-        if not train_backbone:
-            return False
-        if backbone_unfreeze_stage is None:
-            return True
-        if backbone_unfreeze_stage not in stages:
-            raise ValueError(f"Invalid backbone stage {backbone_unfreeze_stage}")
-        target_idx = stages.index(backbone_unfreeze_stage)
-        for stage in stages[target_idx:]:
-            if sub_name.startswith(stage):
-                return True
-        return False
-
-    for name, module in model.named_modules():
-        if name.startswith("backbone_wide") or name.startswith("backbone_narr"):
-            suffix = name.split(".", 1)[-1] if "." in name else ""
-            if should_train_backbone(suffix):
-                if not train_backbone_bn and isinstance(module, (nn.BatchNorm2d, nn.SyncBatchNorm, ResolutionAwareBatchNorm2d)):
-                    for param in module.parameters():
-                        param.requires_grad = False
-                    continue
-                for param in module.parameters():
-                    param.requires_grad = True
-                    trainable.append(param)
-        elif train_bottleneck and name.startswith("bottleneck"):
-            for param in module.parameters():
-                param.requires_grad = True
-                trainable.append(param)
-        elif train_seg_heads and name.startswith("seg_head"):
-            for param in module.parameters():
-                param.requires_grad = True
-                trainable.append(param)
-        elif train_act_head and name.startswith("act_head"):
-            for param in module.parameters():
-                param.requires_grad = True
-                trainable.append(param)
-
-    if not trainable:
-        raise RuntimeError("No parameters were marked trainable. Check the model structure.")
-
-    return trainable
+    adapted = {}
+    for key, value in state_dict.items():
+        if key.endswith(".running_mean"):
+            adapted[key[: -len(".running_mean")] + ".default_running_mean"] = value
+        elif key.endswith(".running_var"):
+            adapted[key[: -len(".running_var")] + ".default_running_var"] = value
+        elif key.endswith(".num_batches_tracked"):
+            adapted[key[: -len(".num_batches_tracked")] + ".default_num_batches_tracked"] = value
+        else:
+            adapted[key] = value
+    return adapted
 
 
 def calibrate_batch_norm(model, dataset, cfg, device, max_batches=None):
@@ -211,158 +180,6 @@ def _forward_for_bn(model, batch, cfg, device, w_scale=1.0, n_scale=1.0):
         wide_rgbs,
         narr_rgbs,
         spd=None if cfg["all_speeds"] else spds,
-    )
-
-
-def _load_balanced_cache(expected_len):
-    if not BALANCED_CACHE_PATH or not os.path.isfile(BALANCED_CACHE_PATH):
-        return None
-    try:
-        with open(BALANCED_CACHE_PATH, "r") as f:
-            payload = json.load(f)
-    except Exception:
-        return None
-
-    if payload.get("dataset_len") != expected_len:
-        return None
-    if payload.get("sample_size") != SAMPLE_SIZE:
-        return None
-    if payload.get("seed") != SAMPLE_SEED:
-        return None
-    if payload.get("data_dir") != os.path.abspath(DATA_DIR):
-        return None
-    if payload.get("config_path") != os.path.abspath(CONFIG_PATH):
-        return None
-
-    indices = payload.get("indices")
-    if not isinstance(indices, list):
-        return None
-    return indices
-
-
-def _save_balanced_cache(indices, dataset_len):
-    if not BALANCED_CACHE_PATH:
-        return
-    payload = {
-        "dataset_len": dataset_len,
-        "sample_size": SAMPLE_SIZE,
-        "seed": SAMPLE_SEED,
-        "data_dir": os.path.abspath(DATA_DIR),
-        "config_path": os.path.abspath(CONFIG_PATH),
-        "indices": indices,
-    }
-    os.makedirs(os.path.dirname(BALANCED_CACHE_PATH), exist_ok=True)
-    with open(BALANCED_CACHE_PATH, "w") as f:
-        json.dump(payload, f)
-
-
-def spd_lerp(v, x, min_val, max_val):
-    D = v.shape[2]
-    x = (x - min_val) / (max_val - min_val + 1e-8) * (D - 1)
-    x0 = torch.floor(x).long().clamp(min=0, max=D - 1)
-    x1 = torch.ceil(x).long().clamp(min=0, max=D - 1)
-    w = (x - x0.float()).unsqueeze(-1).unsqueeze(-1)
-    gather_shape = (v.shape[0], v.shape[1], 1, v.shape[3])
-    idx0 = x0.view(v.shape[0], 1, 1, 1).expand(gather_shape)
-    idx1 = x1.view(v.shape[0], 1, 1, 1).expand(gather_shape)
-    v0 = torch.gather(v, 2, idx0).squeeze(2)
-    v1 = torch.gather(v, 2, idx1).squeeze(2)
-    return (1 - w) * v0 + w * v1
-
-
-def action_logits(raw_logits, num_steers, num_throts):
-    steer_logits = raw_logits[..., :num_steers]
-    throt_logits = raw_logits[..., num_steers : num_steers + num_throts]
-    brake_logits = raw_logits[..., -1:]
-
-    steer_logits = steer_logits.repeat(1, 1, 1, num_throts)
-    throt_logits = throt_logits.repeat_interleave(num_steers, -1)
-
-    return torch.cat([steer_logits + throt_logits, brake_logits], dim=-1)
-
-
-def _to_numpy_batch(batch):
-    if batch is None:
-        return None
-    if isinstance(batch, torch.Tensor):
-        return batch.detach().cpu().numpy()
-    return batch
-
-
-def _resize_images(batch, scale):
-    if batch is None or abs(scale - 1.0) < 1e-6:
-        return batch
-    np_batch = _to_numpy_batch(batch)
-    resized = [
-        cv2.resize(
-            img,
-            (int(round(img.shape[1] * scale)), int(round(img.shape[0] * scale))),
-            interpolation=cv2.INTER_AREA,
-        )
-        for img in np_batch
-    ]
-    return np.stack(resized, axis=0)
-
-
-def _resize_labels(batch, scale):
-    if batch is None or abs(scale - 1.0) < 1e-6:
-        return batch
-    np_batch = _to_numpy_batch(batch)
-    resized = [
-        cv2.resize(
-            lbl,
-            (int(round(lbl.shape[1] * scale)), int(round(lbl.shape[0] * scale))),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        for lbl in np_batch
-    ]
-    return np.stack(resized, axis=0)
-
-
-def _forward_with_features(model, wide_rgbs, narr_rgbs, spds, cfg):
-    wide_embed = model.backbone_wide(model.normalize(wide_rgbs / 255.0))
-    wide_seg = model.seg_head_wide(wide_embed)
-
-    if model.two_cam:
-        narr_embed = model.backbone_narr(model.normalize(narr_rgbs / 255.0))
-        narr_seg = model.seg_head_narr(narr_embed)
-        pooled = torch.cat(
-            [
-                wide_embed.mean(dim=[2, 3]),
-                model.bottleneck_narr(narr_embed.mean(dim=[2, 3])),
-            ],
-            dim=1,
-        )
-    else:
-        narr_embed = None
-        narr_seg = None
-        pooled = wide_embed.mean(dim=[2, 3])
-
-    if cfg["all_speeds"]:
-        act = model.act_head(pooled).view(
-            -1,
-            model.num_cmds,
-            model.num_speeds,
-            model.num_steers + model.num_throts + 1,
-        )
-        act = action_logits(act, model.num_steers, model.num_throts)
-    else:
-        speed_feat = model.spd_encoder(spds[:, None])
-        act = model.act_head(torch.cat([pooled, speed_feat], dim=1)).view(
-            -1,
-            model.num_cmds,
-            1,
-            model.num_steers + model.num_throts + 1,
-        )
-        act = action_logits(act, model.num_steers, model.num_throts).squeeze(2)
-
-    return dict(
-        act=act,
-        wide_seg=wide_seg,
-        narr_seg=narr_seg,
-        pooled=pooled,
-        wide_embed=wide_embed,
-        narr_embed=narr_embed,
     )
 
 
@@ -522,6 +339,13 @@ def main():
     device = torch.device(DEVICE)
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
 
+    if not os.path.isdir(DATA_DIR):
+        raise FileNotFoundError(
+            f"DATA_DIR does not exist: {DATA_DIR}\n"
+            "Set WOR_DATA_DIR to your dataset root, e.g.\n"
+            "  export WOR_DATA_DIR='/path/to/main_trajs_converted'"
+        )
+
     with open(CONFIG_PATH, "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -543,7 +367,14 @@ def main():
                 f"SAMPLE_SIZE {SAMPLE_SIZE} exceeds dataset length {len(train_dataset)}"
             )
         if USE_BALANCED_SAMPLING and hasattr(train_dataset, "balanced_indices"):
-            cached_indices = _load_balanced_cache(base_dataset_len)
+            cached_indices = _load_balanced_cache(
+                BALANCED_CACHE_PATH,
+                base_dataset_len,
+                SAMPLE_SIZE,
+                SAMPLE_SEED,
+                DATA_DIR,
+                CONFIG_PATH,
+            )
             if cached_indices is not None:
                 subset_indices = cached_indices
                 print(
@@ -556,7 +387,15 @@ def main():
                 print(
                     f"Sampling {len(subset_indices)} balanced frames from the JSON dataset"
                 )
-                _save_balanced_cache(subset_indices, base_dataset_len)
+                _save_balanced_cache(
+                    BALANCED_CACHE_PATH,
+                    subset_indices,
+                    base_dataset_len,
+                    SAMPLE_SIZE,
+                    SAMPLE_SEED,
+                    DATA_DIR,
+                    CONFIG_PATH,
+                )
         else:
             generator = torch.Generator().manual_seed(SAMPLE_SEED)
             subset_indices = (
@@ -577,6 +416,7 @@ def main():
     model = CameraModel(cfg).to(device)
     convert_bn_to_resaware(model)
     student_state_dict, _ = _load_checkpoint(CHECKPOINT_PATH, device)
+    student_state_dict = _adapt_state_dict_for_resaware(student_state_dict)
     model.load_state_dict(student_state_dict, strict=False)
     model.train()
 
@@ -585,6 +425,7 @@ def main():
         teacher_model = CameraModel(cfg).to(device)
         convert_bn_to_resaware(teacher_model)
         teacher_state_dict, _ = _load_checkpoint(TEACHER_CHECKPOINT, device)
+        teacher_state_dict = _adapt_state_dict_for_resaware(teacher_state_dict)
         teacher_model.load_state_dict(teacher_state_dict, strict=False)
         teacher_model.eval()
         for param in teacher_model.parameters():
@@ -620,6 +461,7 @@ def main():
             train_bottleneck=TRAIN_BOTTLENECK,
             train_seg_heads=TRAIN_SEG_HEADS,
             train_act_head=TRAIN_ACT_HEAD,
+            bn_types=(nn.BatchNorm2d, nn.SyncBatchNorm, ResolutionAwareBatchNorm2d),
         )
         return torch.optim.Adam(params, lr=LEARNING_RATE)
 
