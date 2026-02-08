@@ -128,7 +128,25 @@ Batch experiment runner:
 python run_experiments.py --config experiments/full.yaml
 ```
 
-## 3. WoR Dataset (Training)
+## 3. Generate Paper Figures
+
+Figure scripts are driven by prepared chart tables derived from experiment CSV logs.
+Run the chart bridge first:
+
+```bash
+python outputs/build_charts_bridge.py --logs-dir outputs --out-dir outputs/chart_bridge
+```
+
+This generates:
+
+- `outputs/chart_bridge/chart1.png` (Figure 3)
+- `outputs/chart_bridge/chart2.png` (Figure 4)
+- `outputs/chart_bridge/chart3.png` (Figure 5a)
+- `outputs/chart_bridge/chart4.png` (Figure 5b)
+
+It also writes intermediate files (`chart1.txt` .. `chart4.txt`, `chart*_data.csv`) for traceability.
+
+## 4. WoR Dataset (Training)
 
 For fine-tuning, use the WoR Rails dataset (converted from lmdb):
 
@@ -136,7 +154,7 @@ For fine-tuning, use the WoR Rails dataset (converted from lmdb):
 - Data format: per-trajectory folders with `data.json` and sensor files (RGB/semantic labels).
 - Set `WOR_DATA_DIR` to the dataset root (or place the data at `data/main_trajs_converted`).
 
-## 4. Run Paper Fine-Tuning
+## 5. Run Paper Fine-Tuning
 
 The two paper training scripts are:
 
@@ -157,7 +175,7 @@ python finetune_bn_from_json.py
 python finetune_resaware_from_json.py
 ```
 
-## 5. Notes
+## 6. Notes
 
 - WoR pretrained configs and weights are under `pcla_agents/wor_pretrained/`.
 - Routes follow Leaderboard XML format (`sample_route.xml` is included).
