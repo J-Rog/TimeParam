@@ -22,7 +22,8 @@ The project is built on top of **PCLA (Pretrained CARLA Leaderboard Agents)** an
 - OS: Ubuntu 22 (tested)
 - Python: 3.8+
 - CARLA: 0.9.16 (UE4) recommended for this repo
-- GPU: CUDA-capable GPU strongly recommended
+- GPU: CUDA-capable GPU with 24GB of VRAM
+
 
 ## 1. Setup
 
@@ -47,13 +48,11 @@ Set your WoR dataset root once (recommended):
 export WOR_DATA_DIR="/path/to/main_trajs_converted"
 ```
 
-Optional: check your PyTorch/CUDA pair:
 
 ```bash
 python pcla_functions/cuda.py
 ```
 
-If your workflow needs `torch-scatter`, install the wheel matching your exact PyTorch and CUDA versions.
 
 ### 1.3 CARLA Python API Setup
 
