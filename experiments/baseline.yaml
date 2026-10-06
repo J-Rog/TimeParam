@@ -1,0 +1,12 @@
+experiments:
+  - name: wor_nc_baseline
+    agent: wor_nc
+    agent_config: pcla_agents/wor_pretrained/nocrash_weights/config_nocrash.yaml
+    latencies: [0]
+    vehicle_densities: [0]
+    pedestrian_densities: [0]
+    routes:
+      - name: town02_route0
+        route: routes/routes_devtest.xml
+        route_id: 0
+        sweep_log: outputs/wor_nc_baseline_route0.csv

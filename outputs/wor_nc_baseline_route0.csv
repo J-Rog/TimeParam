@@ -1,0 +1,2 @@
+timestamp,route_id,route_xml,agent,control_period,control_latency,control_steps,latency_steps,vehicle_density,pedestrian_density,status,route_completion,sim_time,wall_time,lane_crossings,collisions_vehicle,collisions_pedestrian,collisions_static,red_lights,message
+2026-10-06T13:31:54.513152,RouteScenario_0_rep0,/home/j479r401/ResAwareWoR/tmp/routes/routes_devtest_route0.xml,wor_nc,0.0,0.0,,,0,0,error,,,,,,,,,"inconsistent use of tabs and spaces in indentation (image_agent.py, line 76)"

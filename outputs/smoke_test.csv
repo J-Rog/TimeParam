@@ -1,0 +1,4 @@
+timestamp,route_id,route_xml,agent,control_period,control_latency,control_steps,latency_steps,vehicle_density,pedestrian_density,status,route_completion,sim_time,wall_time,lane_crossings,collisions_vehicle,collisions_pedestrian,collisions_static,red_lights,message
+2026-09-30T20:18:54.464655,RouteScenario_0_rep0,/home/j479r401/ResAwareWoR/my_sample_route.xml,wor_nc,0.05,0.0,2,0,0,0,aborted,0.08,44.624999999998536,39.25149869918823,0,0,0,1,0,low_speed_timeout
+2026-09-30T20:33:49.411167,RouteScenario_0_rep0,/home/j479r401/ResAwareWoR/tmp/routes/routes_devtest_route0.xml,wor_nc,0.05,0.0,2,0,0,0,completed,99.01,263.9750000000338,227.6745502948761,8,0,0,0,2,route_completed
+2026-10-06T12:20:22.161760,RouteScenario_0_rep0,/home/j479r401/ResAwareWoR/tmp/routes/routes_devtest_route0.xml,wor_nc,0.05,0.0,2,0,0,0,completed,99.01,263.6500000000341,225.48216104507446,7,0,0,0,2,route_completed

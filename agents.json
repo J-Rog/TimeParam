@@ -63,11 +63,7 @@
         "nc": {
             "agent": "pcla_agents/wor/image_agent.py",
             "config": "pcla_agents/wor_pretrained/nocrash_weights/config_nocrash.yaml"
-        },
-        "bn": {
-            "agent": "pcla_agents/wor/image_agent.py",
-            "config": "outputs/config_bn.yaml"
-        }
+        } 
     },
     "lmdrive":{
         "llava": {

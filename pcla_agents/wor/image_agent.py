@@ -15,13 +15,16 @@ from torch.distributions.categorical import Categorical
 from leaderboard_codes.autonomous_agent1 import AutonomousAgent, Track
 from leaderboard_codes.local_planner import RoadOption
 from utils import visualize_obs
-
+"""
+modification
 from rails.models import (
     EgoModel,
     CameraModel,
     convert_bn_to_resaware,
     state_dict_has_resaware_stats,
 )
+"""
+from rails.models import CameraModel
 from waypointer import Waypointer
 
 def get_entry_point():
@@ -67,9 +70,11 @@ class ImageAgent(AutonomousAgent):
 
         self.device = torch.device('cuda')
         self.sensor_tick = getattr(self, 'sensor_tick', 0.05)
-        self.wide_scale = getattr(self, 'wide_scale', 1.0)
-        self.narr_scale = getattr(self, 'narr_scale', 1.0)
-
+        #modification
+        #self.wide_scale = getattr(self, 'wide_scale', 1.0)
+        #self.narr_scale = getattr(self, 'narr_scale', 1.0)
+	'''
+	modification
         self.image_model = CameraModel(config).to(self.device)
         checkpoint_payload = torch.load(self.main_model_dir, map_location=self.device)
         checkpoint_meta = {}
@@ -94,6 +99,16 @@ class ImageAgent(AutonomousAgent):
             print(f"Loaded res-aware checkpoint supporting scales: {self.supported_resolutions}")
         self.checkpoint_wide_scale = checkpoint_meta.get('wide_scale')
         self.checkpoint_narr_scale = checkpoint_meta.get('narr_scale')
+        '''
+
+	    self.image_model = CameraModel(config).to(self.device)
+	    checkpoint_payload = torch.load(self.main_model_dir, map_location=self.device)
+        checkpoint_state = (
+            checkpoint_payload["state_dict"]
+            if isinstance(checkpoint_payload, dict) and "state_dict" in checkpoint_payload
+            else checkpoint_payload
+        )
+        self.image_model.load_state_dict(checkpoint_state)
         self.image_model.eval()
 
         self.vizs = []
@@ -154,7 +169,7 @@ class ImageAgent(AutonomousAgent):
             _, wide_rgb = input_data.get(f'Wide_RGB_{i}')
             wide_rgb_crop = wide_rgb[self.wide_crop_top:,:,:3]
             _wide_rgb = wide_rgb_crop[...,::-1].copy()
-            _wide_rgb = self._resize_rgb(_wide_rgb, self.wide_scale)
+            #Modification _wide_rgb = self._resize_rgb(_wide_rgb, self.wide_scale)
             wide_rgbs.append(_wide_rgb)
 
         wide_rgbs_con = np.concatenate([wide_rgbs[0],wide_rgbs[1],wide_rgbs[2]], axis=1)
@@ -164,7 +179,7 @@ class ImageAgent(AutonomousAgent):
         _, narr_rgb = input_data.get(f'Narrow_RGB')
         narr_rgb_crop = narr_rgb[:-self.narr_crop_bottom,:,:3]
         _narr_rgb = narr_rgb_crop[...,::-1].copy()
-        _narr_rgb = self._resize_rgb(_narr_rgb, self.narr_scale)
+        #Modification _narr_rgb = self._resize_rgb(_narr_rgb, self.narr_scale)
 
         # Crop images
         #_wide_rgb = wide_rgb[self.wide_crop_top:,:,:3]
@@ -283,7 +298,8 @@ class ImageAgent(AutonomousAgent):
         #     steer = min(max(steer, -0.4), 0.4) # no crazy steerings when lane changing
 
         return steer, throt, brake
-
+"""
+Modification
     def _resize_rgb(self, rgb, scale):
         if scale is None or abs(scale - 1.0) < 1e-6:
             return rgb
@@ -293,7 +309,7 @@ class ImageAgent(AutonomousAgent):
             max(1, int(round(h * scale))),
         )
         return cv2.resize(rgb, new_size, interpolation=cv2.INTER_AREA)
-    
+"""
 def load_state_dict(model, path):
 
     from collections import OrderedDict

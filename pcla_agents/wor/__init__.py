@@ -1,3 +1,9 @@
+from .ego_model import Egomodel
+from .main_model import CameraModel
 
+__all__ = [
+        "EgoModel",
+        "CameraModel",
+]
 
-__all__ = ['DummyController']
+#Modification __all__ = ['DummyController']
