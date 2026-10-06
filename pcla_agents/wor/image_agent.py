@@ -73,8 +73,8 @@ class ImageAgent(AutonomousAgent):
         #modification
         #self.wide_scale = getattr(self, 'wide_scale', 1.0)
         #self.narr_scale = getattr(self, 'narr_scale', 1.0)
-	'''
-	modification
+        '''
+        modification
         self.image_model = CameraModel(config).to(self.device)
         checkpoint_payload = torch.load(self.main_model_dir, map_location=self.device)
         checkpoint_meta = {}
@@ -101,8 +101,8 @@ class ImageAgent(AutonomousAgent):
         self.checkpoint_narr_scale = checkpoint_meta.get('narr_scale')
         '''
 
-	    self.image_model = CameraModel(config).to(self.device)
-	    checkpoint_payload = torch.load(self.main_model_dir, map_location=self.device)
+        self.image_model = CameraModel(config).to(self.device)
+        checkpoint_payload = torch.load(self.main_model_dir, map_location=self.device)
         checkpoint_state = (
             checkpoint_payload["state_dict"]
             if isinstance(checkpoint_payload, dict) and "state_dict" in checkpoint_payload
