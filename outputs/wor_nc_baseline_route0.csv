@@ -1,2 +1,6 @@
 timestamp,route_id,route_xml,agent,control_period,control_latency,control_steps,latency_steps,vehicle_density,pedestrian_density,status,route_completion,sim_time,wall_time,lane_crossings,collisions_vehicle,collisions_pedestrian,collisions_static,red_lights,message
 2026-10-06T13:31:54.513152,RouteScenario_0_rep0,/home/j479r401/ResAwareWoR/tmp/routes/routes_devtest_route0.xml,wor_nc,0.0,0.0,,,0,0,error,,,,,,,,,"inconsistent use of tabs and spaces in indentation (image_agent.py, line 76)"
+2026-10-06T14:31:36.090958,RouteScenario_0_rep0,/home/j479r401/TimeParam/tmp/routes/routes_devtest_route0.xml,wor_nc,0.0,0.0,,,0,0,error,,,,,,,,,"inconsistent use of tabs and spaces in indentation (image_agent.py, line 76)"
+2026-10-06T14:34:49.580491,RouteScenario_0_rep0,/home/j479r401/TimeParam/tmp/routes/routes_devtest_route0.xml,wor_nc,0.0,0.0,,,0,0,error,,,,,,,,,No module named 'pcla_agents.wor.ego_model'
+2026-10-06T14:38:39.241007,RouteScenario_0_rep0,/home/j479r401/TimeParam/tmp/routes/routes_devtest_route0.xml,wor_nc,0.0,0.0,,,0,0,error,,,,,,,,,No module named 'rails.models.resaware_bn'
+2026-10-06T14:45:50.648781,RouteScenario_0_rep0,/home/j479r401/TimeParam/tmp/routes/routes_devtest_route0.xml,wor_nc,0.05,0.0,2,0,0,0,completed,99.01,262.90000000003477,223.3238010406494,9,0,0,0,2,route_completed
