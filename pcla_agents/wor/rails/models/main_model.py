@@ -93,53 +93,130 @@ class CameraModel(nn.Module):
         return act_output, wide_seg_output, narr_seg_output
 
 
+    def extract_policy_features(self, wide_rgb, narr_rgb):
+    """
+    Convert one batch of camera images into the pooled visual feature used by
+    the driving/action head.
+
+    Returns:
+        Tensor of shape [batch_size, feature_dim].
+        feature_dim is normally 512 for the current wor_nc configuration.
+    """
+    wide_embed = self.backbone_wide(
+        self.normalize(wide_rgb / 255.0)
+    )
+
+    if self.two_cam:
+        narr_embed = self.backbone_narr(
+            self.normalize(narr_rgb / 255.0)
+        )
+
+        features = torch.cat([
+            wide_embed.mean(dim=[2, 3]),
+            self.bottleneck_narr(
+                narr_embed.mean(dim=[2, 3])
+            ),
+        ], dim=1)
+    else:
+        features = wide_embed.mean(dim=[2, 3])
+
+    return features
+    
+    def policy_from_features(self, features, cmd, spd=None):
+    """
+    Apply the existing frozen action head to already-computed visual features.
+
+    Args:
+        features: pooled visual features, shape [batch_size, feature_dim]
+        cmd: integer route command
+        spd: vehicle-speed tensor, required only when all_speeds is False
+
+    Returns:
+        steer_logits, throt_logits, brake_logits
+    """
+    if self.all_speeds:
+        act_output = self.act_head(features).view(
+            -1,
+            self.num_cmds,
+            self.num_speeds,
+            self.num_steers + self.num_throts + 1,
+        )
+
+        steer_logits = act_output[
+            0, cmd, :, :self.num_steers
+        ]
+        throt_logits = act_output[
+            0,
+            cmd,
+            :,
+            self.num_steers:self.num_steers + self.num_throts,
+        ]
+        brake_logits = act_output[0, cmd, :, -1]
+
+    else:
+        assert spd is not None
+
+        act_input = torch.cat([
+            features,
+            self.spd_encoder(spd[:, None]),
+        ], dim=1)
+
+        act_output = self.act_head(act_input).view(
+            -1,
+            self.num_cmds,
+            1,
+            self.num_steers + self.num_throts + 1,
+        )
+
+        steer_logits = act_output[
+            0, cmd, 0, :self.num_steers
+        ]
+        throt_logits = act_output[
+            0,
+            cmd,
+            0,
+            self.num_steers:self.num_steers + self.num_throts,
+        ]
+        brake_logits = act_output[0, cmd, 0, -1]
+
+    return steer_logits, throt_logits, brake_logits
+
     @torch.no_grad()
-    def policy(self, wide_rgb, narr_rgb, cmd, spd=None):
-        
-        assert (self.all_speeds and spd is None) or \
-               (not self.all_speeds and spd is not None)
-        
-        wide_embed = self.backbone_wide(self.normalize(wide_rgb/255.))
-        if self.two_cam:
-            narr_embed = self.backbone_narr(self.normalize(narr_rgb/255.))
-            embed = torch.cat([
-                wide_embed.mean(dim=[2,3]),
-                self.bottleneck_narr(narr_embed.mean(dim=[2,3])),
-            ], dim=1)
-        else:
-            embed = wide_embed.mean(dim=[2,3])
-        
-        # Action logits
-        if self.all_speeds:
-            act_output = self.act_head(embed).view(-1,self.num_cmds,self.num_speeds,self.num_steers+self.num_throts+1)
-            # Action logits
-            steer_logits = act_output[0,cmd,:,:self.num_steers]
-            throt_logits = act_output[0,cmd,:,self.num_steers:self.num_steers+self.num_throts]
-            brake_logits = act_output[0,cmd,:,-1]
-        else:
-            assert spd is not None
-            act_output = self.act_head(torch.cat([embed, self.spd_encoder(spd[:,None])], dim=1)).view(-1,self.num_cmds,1,self.num_steers+self.num_throts+1)
-            
-            # Action logits
-            steer_logits = act_output[0,cmd,0,:self.num_steers]
-            throt_logits = act_output[0,cmd,0,self.num_steers:self.num_steers+self.num_throts]
-            brake_logits = act_output[0,cmd,0,-1]
+    def policy(
+        self,
+        wide_rgb,
+        narr_rgb,
+        cmd,
+        spd=None,
+        delay_adapter=None,
+        latency_s=None,
+    ):
+        """
+        Inference-only policy call.
 
-        return steer_logits, throt_logits, brake_logits
+        When no delay adapter is supplied, this follows the original WoR policy
+        path. When an adapter and latency are supplied, the adapter modifies the
+        pooled visual feature before the unchanged action head is used.
+        """
+        features = self.extract_policy_features(wide_rgb, narr_rgb)
 
+        if delay_adapter is not None and latency_s is not None:
+            features = delay_adapter(features, latency_s)
 
-def action_logits(raw_logits: torch.Tensor, num_steers: int, num_throts: int) -> torch.Tensor:
-    
-    steer_logits = raw_logits[...,:num_steers]
-    throt_logits = raw_logits[...,num_steers:num_steers+num_throts]
-    brake_logits = raw_logits[...,-1:]
-    
-    steer_logits = steer_logits.repeat(1,1,1,num_throts)
-    throt_logits = throt_logits.repeat_interleave(num_steers,-1)
-    
-    act_logits = torch.cat([steer_logits + throt_logits, brake_logits], dim=-1)
-    
-    return act_logits
+        return self.policy_from_features(features, cmd, spd)
+
+    def action_logits(raw_logits: torch.Tensor, num_steers: int, num_throts: int) -> torch.Tensor:
+        
+        steer_logits = raw_logits[...,:num_steers]
+        throt_logits = raw_logits[...,num_steers:num_steers+num_throts]
+        brake_logits = raw_logits[...,-1:]
+        
+        steer_logits = steer_logits.repeat(1,1,1,num_throts)
+        throt_logits = throt_logits.repeat_interleave(num_steers,-1)
+        
+        act_logits = torch.cat([steer_logits + throt_logits, brake_logits], dim=-1)
+        
+        return act_logits
 
 
 
