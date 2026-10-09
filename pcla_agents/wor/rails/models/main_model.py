@@ -94,92 +94,92 @@ class CameraModel(nn.Module):
 
 
     def extract_policy_features(self, wide_rgb, narr_rgb):
-    """
-    Convert one batch of camera images into the pooled visual feature used by
-    the driving/action head.
+        """
+        Convert one batch of camera images into the pooled visual feature used by
+        the driving/action head.
 
-    Returns:
-        Tensor of shape [batch_size, feature_dim].
-        feature_dim is normally 512 for the current wor_nc configuration.
-    """
-    wide_embed = self.backbone_wide(
-        self.normalize(wide_rgb / 255.0)
-    )
-
-    if self.two_cam:
-        narr_embed = self.backbone_narr(
-            self.normalize(narr_rgb / 255.0)
+        Returns:
+            Tensor of shape [batch_size, feature_dim].
+            feature_dim is normally 512 for the current wor_nc configuration.
+        """
+        wide_embed = self.backbone_wide(
+            self.normalize(wide_rgb / 255.0)
         )
 
-        features = torch.cat([
-            wide_embed.mean(dim=[2, 3]),
-            self.bottleneck_narr(
-                narr_embed.mean(dim=[2, 3])
-            ),
-        ], dim=1)
-    else:
-        features = wide_embed.mean(dim=[2, 3])
+        if self.two_cam:
+            narr_embed = self.backbone_narr(
+                self.normalize(narr_rgb / 255.0)
+            )
 
-    return features
+            features = torch.cat([
+                wide_embed.mean(dim=[2, 3]),
+                self.bottleneck_narr(
+                    narr_embed.mean(dim=[2, 3])
+                ),
+            ], dim=1)
+        else:
+            features = wide_embed.mean(dim=[2, 3])
+
+        return features
     
     def policy_from_features(self, features, cmd, spd=None):
-    """
-    Apply the existing frozen action head to already-computed visual features.
+        """
+        Apply the existing frozen action head to already-computed visual features.
 
-    Args:
-        features: pooled visual features, shape [batch_size, feature_dim]
-        cmd: integer route command
-        spd: vehicle-speed tensor, required only when all_speeds is False
+        Args:
+            features: pooled visual features, shape [batch_size, feature_dim]
+            cmd: integer route command
+            spd: vehicle-speed tensor, required only when all_speeds is False
 
-    Returns:
-        steer_logits, throt_logits, brake_logits
-    """
-    if self.all_speeds:
-        act_output = self.act_head(features).view(
-            -1,
-            self.num_cmds,
-            self.num_speeds,
-            self.num_steers + self.num_throts + 1,
-        )
+        Returns:
+            steer_logits, throt_logits, brake_logits
+        """
+        if self.all_speeds:
+            act_output = self.act_head(features).view(
+                -1,
+                self.num_cmds,
+                self.num_speeds,
+                self.num_steers + self.num_throts + 1,
+            )
 
-        steer_logits = act_output[
-            0, cmd, :, :self.num_steers
-        ]
-        throt_logits = act_output[
-            0,
-            cmd,
-            :,
-            self.num_steers:self.num_steers + self.num_throts,
-        ]
-        brake_logits = act_output[0, cmd, :, -1]
+            steer_logits = act_output[
+                0, cmd, :, :self.num_steers
+            ]
+            throt_logits = act_output[
+                0,
+                cmd,
+                :,
+                self.num_steers:self.num_steers + self.num_throts,
+            ]
+            brake_logits = act_output[0, cmd, :, -1]
 
-    else:
-        assert spd is not None
+        else:
+            assert spd is not None
 
-        act_input = torch.cat([
-            features,
-            self.spd_encoder(spd[:, None]),
-        ], dim=1)
+            act_input = torch.cat([
+                features,
+                self.spd_encoder(spd[:, None]),
+            ], dim=1)
 
-        act_output = self.act_head(act_input).view(
-            -1,
-            self.num_cmds,
-            1,
-            self.num_steers + self.num_throts + 1,
-        )
+            act_output = self.act_head(act_input).view(
+                -1,
+                self.num_cmds,
+                1,
+                self.num_steers + self.num_throts + 1,
+            )
 
-        steer_logits = act_output[
-            0, cmd, 0, :self.num_steers
-        ]
-        throt_logits = act_output[
-            0,
-            cmd,
-            0,
-            self.num_steers:self.num_steers + self.num_throts,
-        ]
-        brake_logits = act_output[0, cmd, 0, -1]
+            steer_logits = act_output[
+                0, cmd, 0, :self.num_steers
+            ]
+            throt_logits = act_output[
+                0,
+                cmd,
+                0,
+                self.num_steers:self.num_steers + self.num_throts,
+            ]
+            brake_logits = act_output[0, cmd, 0, -1]
 
-    return steer_logits, throt_logits, brake_logits
+        return steer_logits, throt_logits, brake_logits
 
     @torch.no_grad()
     def policy(
