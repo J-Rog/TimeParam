@@ -10,6 +10,7 @@ import random
 import string
 import cv2
 
+
 from torch.distributions.categorical import Categorical
 
 from leaderboard_codes.autonomous_agent1 import AutonomousAgent, Track
