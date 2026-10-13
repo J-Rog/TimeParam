@@ -27,6 +27,8 @@ from rails.models import (
 """
 from rails.models import CameraModel
 from waypointer import Waypointer
+from collections import deque
+from rails.models.time_adapter import DelayFeatureAdapter
 
 def get_entry_point():
     return 'ImageAgent'
@@ -111,6 +113,27 @@ class ImageAgent(AutonomousAgent):
         )
         self.image_model.load_state_dict(checkpoint_state)
         self.image_model.eval()
+        
+        self.observation_latency_s = getattr(self, "observation_latency_s", 0.0)
+        self.max_observation_latency_s = getattr(self,"max_observation_latency_s",0.25,)
+
+        self.frame_history = deque(maxlen=32)
+        self.delay_adapter = None
+
+        if getattr(self, "time_parameterized_control", False):
+            self.delay_adapter = DelayFeatureAdapter(
+            feature_dim=512,
+            max_latency_s=self.max_observation_latency_s,
+        ).to(self.device)
+
+            adapter_path = os.path.join(project_root, self.time_adapter_path)
+            if os.path.isfile(adapter_path):
+                payload = torch.load(adapter_path, map_location=self.device)
+                self.delay_adapter.load_state_dict(payload["state_dict"])
+            else:
+                print(f"Time adapter checkpoint not found: {adapter_path}; using zero adapter.")
+
+            self.delay_adapter.eval()
 
         self.vizs = []
 
@@ -125,6 +148,9 @@ class ImageAgent(AutonomousAgent):
         self.prev_steer = 0
         self.lane_change_counter = 0
         self.stop_counter = 0
+        
+    def set_observation_latency(self, latency_s):
+        self.observation_latency_s = max(0.0, float(latency_s))
 
     def destroy(self):
         if len(self.vizs) == 0:
@@ -164,23 +190,59 @@ class ImageAgent(AutonomousAgent):
         return sensors
 
     def run_step(self, input_data, timestamp, vehicle=None):
-        # changed to match the online leaderboard based on https://github.com/dotchen/WorldOnRails/issues/27
-        wide_rgbs = []
+
+        # 1. Collect the current raw camera packet.
+        wide_packets = []
+        wide_frame_ids = []
+
         for i in range(3):
-            _, wide_rgb = input_data.get(f'Wide_RGB_{i}')
-            wide_rgb_crop = wide_rgb[self.wide_crop_top:,:,:3]
-            _wide_rgb = wide_rgb_crop[...,::-1].copy()
-            #Modification _wide_rgb = self._resize_rgb(_wide_rgb, self.wide_scale)
+            frame_id, wide_rgb = input_data.get(f"Wide_RGB_{i}")
+            wide_frame_ids.append(frame_id)
+            wide_packets.append(wide_rgb.copy())
+
+        narr_frame_id, narr_rgb = input_data.get("Narrow_RGB")
+
+        # 2. Record it in the visual-observation history.
+        self.frame_history.append({
+            "timestamp": timestamp,
+            "wide_rgbs": wide_packets,
+            "narr_rgb": narr_rgb.copy(),
+            "frame_ids": wide_frame_ids,
+            "narr_frame_id": narr_frame_id,
+        })
+
+        # 3. Select the newest packet available at or before T - latency.
+        target_time = timestamp - self.observation_latency_s
+        selected = self.frame_history[0]
+
+        for packet in reversed(self.frame_history):
+            if packet["timestamp"] <= target_time:
+                selected = packet
+                break
+
+        actual_latency_s = max(0.0, timestamp - selected["timestamp"])
+
+        # 4. Preprocess the selected, potentially stale RGB images.
+        wide_rgbs = []
+        for wide_rgb in selected["wide_rgbs"]:
+            wide_rgb_crop = wide_rgb[self.wide_crop_top:, :, :3]
+            _wide_rgb = wide_rgb_crop[..., ::-1].copy()  # CARLA BGR -> RGB
             wide_rgbs.append(_wide_rgb)
 
-        wide_rgbs_con = np.concatenate([wide_rgbs[0],wide_rgbs[1],wide_rgbs[2]], axis=1)
-        wide_rgbs_ = torch.tensor(wide_rgbs_con[None]).float().permute(0,3,1,2).to(self.device)
-        
-        
-        _, narr_rgb = input_data.get(f'Narrow_RGB')
-        narr_rgb_crop = narr_rgb[:-self.narr_crop_bottom,:,:3]
-        _narr_rgb = narr_rgb_crop[...,::-1].copy()
-        #Modification _narr_rgb = self._resize_rgb(_narr_rgb, self.narr_scale)
+        wide_rgbs_con = np.concatenate(
+            [wide_rgbs[0], wide_rgbs[1], wide_rgbs[2]],
+            axis=1,
+        )
+        wide_rgbs_ = (
+            torch.tensor(wide_rgbs_con[None])
+            .float()
+            .permute(0, 3, 1, 2)
+            .to(self.device)
+        )
+
+        narr_rgb = selected["narr_rgb"]
+        narr_rgb_crop = narr_rgb[:-self.narr_crop_bottom, :, :3]
+        _narr_rgb = narr_rgb_crop[..., ::-1].copy()
 
         # Crop images
         #_wide_rgb = wide_rgb[self.wide_crop_top:,:,:3]
@@ -220,6 +282,13 @@ class ImageAgent(AutonomousAgent):
 
         _wide_rgb = torch.tensor(_wide_rgb[None]).float().permute(0,3,1,2).to(self.device)
         _narr_rgb = torch.tensor(_narr_rgb[None]).float().permute(0,3,1,2).to(self.device)
+        
+        latency_tensor = torch.tensor(
+            [actual_latency_s],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        
         
         if self.all_speeds:
             steer_logits, throt_logits, brake_logits = self.image_model.policy(wide_rgbs_, _narr_rgb, cmd_value)
