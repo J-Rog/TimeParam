@@ -36,3 +36,7 @@ ego_model_dir: ''
 ego_data_dir: ''
 main_model_dir: 'wor_pretrained/nocrash_weights/main_model_16.th'
 main_data_dir: ''
+time_parameterized_control: true
+time_adapter_path: outputs/time_adapter.th
+max_observation_latency_s: 0.25
+observation_latency_s: 0.0
