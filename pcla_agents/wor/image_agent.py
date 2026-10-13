@@ -291,14 +291,16 @@ class ImageAgent(AutonomousAgent):
         
         
         if self.all_speeds:
-            steer_logits, throt_logits, brake_logits = self.image_model.policy(wide_rgbs_, _narr_rgb, cmd_value)
+            #steer_logits, throt_logits, brake_logits = self.image_model.policy(wide_rgbs_, _narr_rgb, cmd_value)
             #steer_logits, throt_logits, brake_logits = self.image_model.policy(_wide_rgb, _narr_rgb, cmd_value)
+            steer_logits, throt_logits, brake_logits = self.image_model.policy( wide_rgbs_,_narr_rgb,cmd_value,delay_adapter=self.delay_adapter,latency_s=latency_tensor,)
             # Interpolate logits
             steer_logit = self._lerp(steer_logits, spd)
             throt_logit = self._lerp(throt_logits, spd)
             brake_logit = self._lerp(brake_logits, spd)
         else:
-            steer_logit, throt_logit, brake_logit = self.image_model.policy(_wide_rgb, _narr_rgb, cmd_value, spd=torch.tensor([spd]).float().to(self.device))
+            #steer_logit, throt_logit, brake_logit = self.image_model.policy(_wide_rgb, _narr_rgb, cmd_value, spd=torch.tensor([spd]).float().to(self.device))
+            steer_logit, throt_logit, brake_logit = self.image_model.policy(_wide_rgb,_narr_rgb,cmd_value,spd=torch.tensor([spd]).float().to(self.device),delay_adapter=self.delay_adapter,latency_s=latency_tensor,)
 
         
         action_prob = self.action_prob(steer_logit, throt_logit, brake_logit)

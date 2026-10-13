@@ -34,7 +34,8 @@ multi_cam: True
 all_speeds: True
 ego_model_dir: ''
 ego_data_dir: ''
-main_model_dir: 'wor_pretrained/nocrash_weights/main_model_16.th'
+main_model_dir: pcla_agents/wor_pretrained/nocrash_weights/main_model_16.th
+time_adapter_path: outputs/time_adapter.th
 main_data_dir: ''
 time_parameterized_control: true
 time_adapter_path: outputs/time_adapter.th

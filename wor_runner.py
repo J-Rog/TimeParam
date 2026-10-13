@@ -158,6 +158,8 @@ def run_configuration(
 
         agent_name = args.agent
         pcla = PCLA(agent_name, ego, route_xml, client, agent_config_override=args.agent_config)
+        if hasattr(pcla.agent_instance, "set_observation_latency"):
+            pcla.agent_instance.set_observation_latency(args.observation_latency)
         scorer = LeaderboardLikeScorer(world, route_xml)
         timing.attach(pcla, scorer, args)
 

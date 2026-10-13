@@ -73,6 +73,12 @@ def parse_args():
         type=int,
         help="Restrict the provided route XML to this <route id>. When unset, the first route is used.",
     )
+    parser.add_argument(
+        "--observation-latency",
+        type=float,
+        default=0.0,
+        help="Artificial visual-observation delay in seconds.",
+    )
     return parser.parse_args()
 
 
