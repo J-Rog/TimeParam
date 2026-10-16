@@ -121,6 +121,33 @@ class CameraModel(nn.Module):
             features = wide_embed.mean(dim=[2, 3])
 
         return features
+
+    @property
+    def feature_dim(self):
+        return 512 + (64 if self.two_cam else 0)
+
+    def action_logits_from_features(self, features, speeds):
+        """All commands/speed bins; frozen head still propagates feature gradients."""
+        raw = self.raw_action_logits_from_features(features, speeds)
+        return action_logits(raw, self.num_steers, self.num_throts)
+
+    def driving_logits_from_features(self, features, speeds):
+        """Match ImageAgent.action_prob, including its legacy concatenated layout.
+
+        This differs from the original Q-training joint-action layout. Preserve
+        deployed behavior so the delay experiment does not also change the driver.
+        """
+        raw = self.raw_action_logits_from_features(features, speeds)
+        steer = raw[..., :self.num_steers].repeat(1, 1, 1, self.num_throts)
+        throttle = raw[..., self.num_steers:-1].repeat_interleave(self.num_steers, dim=-1)
+        return torch.cat([steer, throttle, raw[..., -1:]], dim=-1)
+
+    def raw_action_logits_from_features(self, features, speeds):
+        if not self.all_speeds:
+            features = torch.cat([features, self.spd_encoder(speeds[:, None])], dim=1)
+        return self.act_head(features).view(
+            -1, self.num_cmds, self.num_speeds if self.all_speeds else 1,
+            self.num_steers + self.num_throts + 1)
     
     def policy_from_features(self, features, cmd, spd=None):
         """
@@ -190,6 +217,7 @@ class CameraModel(nn.Module):
         spd=None,
         delay_adapter=None,
         latency_s=None,
+        ego_state=None,
     ):
         """
         Inference-only policy call.
@@ -201,22 +229,17 @@ class CameraModel(nn.Module):
         features = self.extract_policy_features(wide_rgb, narr_rgb)
 
         if delay_adapter is not None and latency_s is not None:
-            features = delay_adapter(features, latency_s)
+            features = delay_adapter(features, latency_s, ego_state)
 
         return self.policy_from_features(features, cmd, spd)
 
-    def action_logits(raw_logits: torch.Tensor, num_steers: int, num_throts: int) -> torch.Tensor:
-        
-        steer_logits = raw_logits[...,:num_steers]
-        throt_logits = raw_logits[...,num_steers:num_steers+num_throts]
-        brake_logits = raw_logits[...,-1:]
-        
-        steer_logits = steer_logits.repeat(1,1,1,num_throts)
-        throt_logits = throt_logits.repeat_interleave(num_steers,-1)
-        
-        act_logits = torch.cat([steer_logits + throt_logits, brake_logits], dim=-1)
-        
-        return act_logits
+def action_logits(raw_logits: torch.Tensor, num_steers: int, num_throts: int) -> torch.Tensor:
+    steer_logits = raw_logits[..., :num_steers]
+    throt_logits = raw_logits[..., num_steers:num_steers + num_throts]
+    brake_logits = raw_logits[..., -1:]
+    steer_logits = steer_logits.repeat(1, 1, 1, num_throts)
+    throt_logits = throt_logits.repeat_interleave(num_steers, -1)
+    return torch.cat([steer_logits + throt_logits, brake_logits], dim=-1)
 
 
 

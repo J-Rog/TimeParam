@@ -1,417 +1,210 @@
 #!/usr/bin/env python3
+"""Self-distill current frozen WoR features/actions into a stale-image adapter.
+
+Only DelayFeatureAdapter is trained. No act0/act_0, Q-values, segmentation labels,
+CARLA installation, or original WoR dataset are needed. See docs/SELF_DISTILLATION.md.
 """
-Train a time-delay feature adapter for the frozen WoR camera policy.
-
-Each training sample:
-  stale wide/narrow images at time t - delay
-  -> frozen CameraModel feature extractor
-  -> trainable DelayFeatureAdapter(features, delay)
-  -> frozen CameraModel action head
-  -> KL loss against action values from the current frame at time t
-
-Expected JSON dataset structure:
-  dataset_root/
-    sequence_001/
-      data.json
-      ... referenced RGB files ...
-    sequence_002/
-      data.json
-      ...
-
-Each frame must contain the camera paths used by JSONLabeledMainDataset and
-action labels such as act0 / act_0 / act_val_0.
-"""
-
 import argparse
-import os
+import hashlib
+import json
 import random
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.optim import Adam
 from torch.utils.data import DataLoader
 
-from pcla_agents.wor.rails.datasets.json_main_dataset import (
-    JSONLabeledMainDataset,
-    _read_rgb,
-)
-from pcla_agents.wor.rails.models.main_model import CameraModel
+from delay_dataset import DelayedJSONActionDataset, discover_sequences, split_sequences
+from pcla_agents.wor.rails.models.main_model import CameraModel, action_logits
 from pcla_agents.wor.rails.models.time_adapter import DelayFeatureAdapter
 
-
-class DelayedJSONActionDataset(JSONLabeledMainDataset):
-    """
-    Returns stale visual observations and the action-value target from a newer,
-    current frame in the same trajectory.
-    """
-
-    def __init__(self, data_dir, config_path, max_latency_s, fps):
-        super().__init__(
-            data_dir,
-            config_path,
-            use_augment=False,
-        )
-
-        self.max_latency_s = float(max_latency_s)
-        self.fps = float(fps)
-        self.max_delay_steps = max(1, round(self.max_latency_s * self.fps))
-
-        # A sample identifies its sequence, current time index, and camera.
-        self.samples = []
-        for sequence_index, sequence in enumerate(self.seq_meta):
-            for current_index in range(sequence["n"]):
-                for camera_index in range(len(self.camera_yaws)):
-                    self.samples.append(
-                        (sequence_index, current_index, camera_index)
-                    )
-
-        if not self.samples:
-            raise RuntimeError(
-                "No valid sequences were found. "
-                "Expected data.json files below --data-dir."
-            )
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, index):
-        sequence_index, current_index, camera_index = self.samples[index]
-        sequence = self.seq_meta[sequence_index]
-        frames = sequence["frames"]
-        sequence_dir = sequence["dir"]
-
-        # Randomly choose a delay that is feasible at this point in the sequence.
-        delay_steps = random.randint(
-            0,
-            min(self.max_delay_steps, current_index),
-        )
-        stale_index = current_index - delay_steps
-
-        stale_frame = frames[stale_index]
-        current_frame = frames[current_index]
-
-        def resolve_path(path):
-            return os.path.join(sequence_dir, path.lstrip("/"))
-
-        # Input: stale camera images.
-        wide_path, narr_path = self._resolve_rgb_paths(
-            stale_frame,
-            camera_index,
-        )
-        stale_wide = _read_rgb(resolve_path(wide_path))
-        stale_narr = _read_rgb(resolve_path(narr_path))
-
-        stale_wide = stale_wide[self.wide_crop_top:, :, :]
-        stale_narr = stale_narr[:-self.narr_crop_bottom, :, :]
-
-        # Target: action distribution from the current frame.
-        current_action_values = self._read_action_values(
-            current_frame,
-            camera_index,
-        )
-
-        current_speed = float(
-            self._scalarize(current_frame.get("spd", 0.0))
-        )
-        current_command = int(
-            self._scalarize(current_frame.get("cmd", 0))
-        )
-
-        latency_s = self._frame_time(
-            current_frame,
-            current_index,
-        ) - self._frame_time(
-            stale_frame,
-            stale_index,
-        )
-        latency_s = max(0.0, float(latency_s))
-
-        return (
-            stale_wide,
-            stale_narr,
-            current_action_values,
-            current_speed,
-            current_command,
-            latency_s,
-        )
-
-    def _frame_time(self, frame, fallback_index):
-        # Prefer a real simulator timestamp when the converted JSON contains it.
-        for key in ("timestamp", "time", "sim_time"):
-            if key in frame:
-                return float(self._scalarize(frame[key]))
-
-        # Otherwise assume uniformly sampled data.
-        return fallback_index / self.fps
-
-
-def combine_action_logits(raw_logits, num_steers, num_throts):
-    """
-    Convert separate steer/throttle/brake logits into the joint WoR action
-    distribution, matching CameraModel's original action_logits logic.
-    """
-    steer_logits = raw_logits[..., :num_steers]
-    throt_logits = raw_logits[
-        ...,
-        num_steers:num_steers + num_throts,
-    ]
-    brake_logits = raw_logits[..., -1:]
-
-    steer_logits = steer_logits.repeat(1, 1, 1, num_throts)
-    throt_logits = throt_logits.repeat_interleave(num_steers, dim=-1)
-
-    return torch.cat(
-        [steer_logits + throt_logits, brake_logits],
-        dim=-1,
-    )
+# Retain helper names for users of the previous trainer.
+combine_action_logits = action_logits
 
 
 def action_logits_from_features(base_model, features, speeds):
-    """
-    Run only the frozen action head. Gradients still flow from this function
-    into `features`, and therefore into the trainable adapter.
-    """
-    if base_model.all_speeds:
-        raw_logits = base_model.act_head(features).view(
-            -1,
-            base_model.num_cmds,
-            base_model.num_speeds,
-            base_model.num_steers + base_model.num_throts + 1,
-        )
-    else:
-        speed_features = base_model.spd_encoder(speeds[:, None])
-        action_input = torch.cat([features, speed_features], dim=1)
-        raw_logits = base_model.act_head(action_input).view(
-            -1,
-            base_model.num_cmds,
-            1,
-            base_model.num_steers + base_model.num_throts + 1,
-        )
-
-    return combine_action_logits(
-        raw_logits,
-        base_model.num_steers,
-        base_model.num_throts,
-    )
+    return base_model.action_logits_from_features(features, speeds)
 
 
 def load_base_model(config_path, checkpoint_path, device):
-    with open(config_path, "r") as file:
-        config = yaml.safe_load(file)
+    with open(config_path) as stream:
+        config = yaml.safe_load(stream)
+    config['imagenet_pretrained'] = False
+    model = CameraModel(config).to(device)
+    payload = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(payload.get('state_dict', payload), strict=True)
+    model.eval().requires_grad_(False)
+    return model, config
 
-    # The checkpoint supplies all weights, so do not download ImageNet weights.
-    config["imagenet_pretrained"] = False
 
-    base_model = CameraModel(config).to(device)
+def active_logits(model, features, speeds, commands, config):
+    """Match runtime command selection and linear interpolation at live ego speed."""
+    logits = model.driving_logits_from_features(features, speeds)
+    logits = logits[torch.arange(len(commands), device=commands.device), commands]
+    if not model.all_speeds:
+        return logits[:, 0]
+    span = float(config['max_speeds']) - float(config['min_speeds'])
+    if span <= 0:
+        raise ValueError('max_speeds must exceed min_speeds')
+    position = ((speeds - config['min_speeds']) / span * (model.num_speeds - 1)).clamp(0, model.num_speeds - 1)
+    lower, upper = position.floor().long(), position.ceil().long()
+    rows = torch.arange(len(speeds), device=speeds.device)
+    weight = (position - lower)[:, None]
+    return (1 - weight) * logits[rows, lower] + weight * logits[rows, upper]
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = (
-        checkpoint["state_dict"]
-        if isinstance(checkpoint, dict) and "state_dict" in checkpoint
-        else checkpoint
-    )
-    base_model.load_state_dict(state_dict)
 
-    base_model.eval()
-    for parameter in base_model.parameters():
-        parameter.requires_grad = False
+def distillation_loss(student_logits, teacher_logits, features, teacher_features,
+                      feature_weight=1.0, temperature=1.0, direction='student_teacher'):
+    if temperature <= 0 or feature_weight < 0:
+        raise ValueError('Positive temperature and nonnegative feature weight required')
+    student_logp = F.log_softmax(student_logits / temperature, dim=-1)
+    teacher_logp = F.log_softmax(teacher_logits.detach() / temperature, dim=-1)
+    if direction == 'student_teacher':
+        # Explicit KL(student || teacher), not torch.kl_div's reverse argument order.
+        kl = (student_logp.exp() * (student_logp - teacher_logp)).sum(-1).mean()
+    elif direction == 'teacher_student':
+        kl = F.kl_div(student_logp, teacher_logp, reduction='batchmean', log_target=True)
+    else:
+        raise ValueError(f'Unknown KL direction: {direction}')
+    kl = kl * temperature ** 2
+    feature_loss = F.mse_loss(features, teacher_features.detach())
+    return kl + feature_weight * feature_loss, kl, feature_loss
 
-    return base_model, config
+
+def run_epoch(model, adapter, loader, config, device, args, optimizer=None):
+    model.eval()  # Keep BN buffers frozen as well as all driver weights.
+    adapter.train(optimizer is not None)
+    totals, counts = {}, {}
+    for batch_index, batch in enumerate(loader):
+        images = {key: batch[key].to(device, dtype=torch.float32).permute(0, 3, 1, 2)
+                  for key in ('stale_wide', 'stale_narr', 'current_wide', 'current_narr')}
+        speeds = batch['speed'].to(device, dtype=torch.float32)
+        commands = batch['command'].to(device)
+        latencies = batch['latency_s'].to(device, dtype=torch.float32)
+        ego = batch['ego_state'].to(device)
+        with torch.no_grad():
+            stale = model.extract_policy_features(images['stale_wide'], images['stale_narr'])
+            current = model.extract_policy_features(images['current_wide'], images['current_narr'])
+            teacher = active_logits(model, current, speeds, commands, config)
+        with torch.set_grad_enabled(optimizer is not None):
+            corrected = adapter(stale, latencies, ego)
+            student = active_logits(model, corrected, speeds, commands, config)
+            loss, kl, mse = distillation_loss(student, teacher, corrected, current,
+                args.feature_weight, args.temperature, args.kl_direction)
+            if not torch.isfinite(loss):
+                raise RuntimeError('Non-finite distillation loss')
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+        if args.log_every and (batch_index + 1) % args.log_every == 0:
+            phase = 'train' if optimizer is not None else 'val'
+            print(f'{phase} batch={batch_index + 1}/{len(loader)} loss={float(loss.detach()):.6f}', flush=True)
+        # Offline validation reports both delayed baseline and corrected loss per delay.
+        with torch.no_grad():
+            baseline = active_logits(model, stale, speeds, commands, config)
+            for delay in batch['requested_delay_s'].unique():
+                mask = batch['requested_delay_s'].to(device) == delay.to(device)
+                n = int(mask.sum())
+                name = f'{float(delay) * 1000:g}ms'
+                _, dkl, dmse = distillation_loss(student[mask], teacher[mask], corrected[mask], current[mask],
+                    args.feature_weight, args.temperature, args.kl_direction)
+                _, bkl, bmse = distillation_loss(baseline[mask], teacher[mask], stale[mask], current[mask],
+                    args.feature_weight, args.temperature, args.kl_direction)
+                values = np.array([float(dkl), float(dmse), float(bkl), float(bmse)])
+                totals[name] = totals.get(name, np.zeros(4)) + values * n
+                counts[name] = counts.get(name, 0) + n
+    return {k: dict(zip(('action_kl', 'feature_mse', 'baseline_action_kl', 'baseline_feature_mse'),
+                        (v / counts[k]).tolist()), samples=counts[k]) for k, v in totals.items()}
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def train(args):
-    if args.max_latency_s <= 0:
-        raise ValueError("--max-latency-s must be positive.")
-
+    if args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0 or args.lr <= 0:
+        raise ValueError('Invalid training size, workers or learning rate')
+    if args.temperature <= 0 or args.feature_weight < 0:
+        raise ValueError('Positive temperature and nonnegative feature weight required')
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    base_model, config = load_base_model(
-        args.config_path,
-        args.checkpoint,
-        device,
-    )
-
-    if base_model.act_head[0].in_features != 512:
-        raise ValueError(
-            "This script expects a 512-D visual feature vector, but the "
-            f"loaded action head expects {base_model.act_head[0].in_features}."
-        )
-
-    delay_adapter = DelayFeatureAdapter(
-        feature_dim=512,
-        max_latency_s=args.max_latency_s,
-    ).to(device)
-
-    optimizer = Adam(
-        delay_adapter.parameters(),
-        lr=1e-4,
-    )
-
-    dataset = DelayedJSONActionDataset(
-        data_dir=args.data_dir,
-        config_path=args.config_path,
-        max_latency_s=args.max_latency_s,
-        fps=args.fps,
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=True,
-    )
-
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    global_step = 0
-
+    model, config = load_base_model(args.config_path, args.checkpoint, device)
+    delays_s = [d / 1000 for d in args.delays_ms]
+    sequences = discover_sequences(args.data_dir)
+    manifest = json.loads(Path(args.split_manifest).read_text()) if args.split_manifest else None
+    training, validation, split = split_sequences(sequences, args.seed, args.val_fraction,
+                                                 args.heldout_towns, manifest)
+    ego_dim = {'none': 0, 'speed': 1, 'full': 5}[args.ego_state]
+    adapter = DelayFeatureAdapter(model.feature_dim, args.hidden_dim, args.max_latency_s,
+                                  args.correction_scale, ego_dim).to(device)
+    optimizer = torch.optim.Adam(adapter.parameters(), lr=args.lr)
+    loaders = [DataLoader(DelayedJSONActionDataset(group, config, delays_s, args.max_latency_s, ego_dim),
+                          batch_size=args.batch_size, shuffle=is_train, num_workers=args.num_workers,
+                          pin_memory=device.type == 'cuda', drop_last=False)
+               for group, is_train in ((training, True), (validation, False))]
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.with_suffix('.split.json').write_text(json.dumps(split, indent=2) + '\n')
+    teacher_hash = file_sha256(args.checkpoint)
+    best, history = float('inf'), []
     for epoch in range(args.epochs):
-        delay_adapter.train()
-        running_loss = 0.0
-
-        for (
-            stale_wides,
-            stale_narrs,
-            current_action_values,
-            current_speeds,
-            current_commands,
-            latencies_s,
-        ) in loader:
-
-            stale_wides = (
-                stale_wides.float()
-                .permute(0, 3, 1, 2)
-                .to(device, non_blocking=True)
-            )
-            stale_narrs = (
-                stale_narrs.float()
-                .permute(0, 3, 1, 2)
-                .to(device, non_blocking=True)
-            )
-            current_action_values = current_action_values.float().to(
-                device,
-                non_blocking=True,
-            )
-            current_speeds = current_speeds.float().to(
-                device,
-                non_blocking=True,
-            )
-            current_commands = current_commands.long().to(
-                device,
-                non_blocking=True,
-            )
-            latencies_s = latencies_s.float().to(
-                device,
-                non_blocking=True,
-            )
-
-            # Extract stale visual features with no gradients through base model.
-            with torch.no_grad():
-                stale_features = base_model.extract_policy_features(
-                    stale_wides,
-                    stale_narrs,
-                )
-
-            corrected_features = delay_adapter(
-                stale_features,
-                latencies_s,
-            )
-            student_all_logits = action_logits_from_features(
-                base_model,
-                corrected_features,
-                current_speeds,
-            )
-
-            # JSON labels: [batch, command, action, speed]
-            # Policy logits: [batch, command, speed, action]
-            target_all = F.softmax(
-                current_action_values.permute(0, 1, 3, 2)
-                / config["temperature"],
-                dim=-1,
-            )
-
-            # Train using the route command active at the current frame.
-            batch_indices = torch.arange(
-                student_all_logits.shape[0],
-                device=device,
-            )
-            student_action_logits = student_all_logits[
-                batch_indices,
-                current_commands,
-            ]
-            current_action_target = target_all[
-                batch_indices,
-                current_commands,
-            ]
-
-            loss = F.kl_div(
-                F.log_softmax(student_action_logits, dim=-1),
-                current_action_target,
-                reduction="batchmean",
-            )
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-            global_step += 1
-
-            if global_step % args.log_every == 0:
-                print(
-                    f"epoch={epoch + 1}/{args.epochs} "
-                    f"step={global_step} "
-                    f"loss={running_loss / args.log_every:.6f}"
-                )
-                running_loss = 0.0
-
-        checkpoint = {
-            "state_dict": delay_adapter.state_dict(),
-            "epoch": epoch + 1,
-            "max_latency_s": args.max_latency_s,
-            "feature_dim": 512,
-        }
-        torch.save(checkpoint, args.output)
-        print(f"Saved adapter checkpoint: {args.output}")
+        train_metrics = run_epoch(model, adapter, loaders[0], config, device, args, optimizer)
+        val_metrics = run_epoch(model, adapter, loaders[1], config, device, args)
+        score = sum(m['action_kl'] + args.feature_weight * m['feature_mse'] for m in val_metrics.values()) / len(val_metrics)
+        history.append(dict(epoch=epoch + 1, train=train_metrics, val=val_metrics, val_loss=score))
+        print(json.dumps(history[-1]), flush=True)
+        if score < best:
+            best = score
+            payload = dict(format_version=2, objective='self_distilled_delay', state_dict=adapter.state_dict(),
+                           policy_distribution='image_agent_legacy',
+                           adapter_config=adapter.config(), epoch=epoch + 1, val_loss=score,
+                           base_checkpoint_sha256=teacher_hash, model_config=config,
+                           delays_s=delays_s, split=split, train_routes=sorted({s['route'] for s in training}),
+                           val_routes=sorted({s['route'] for s in validation}),
+                           temperature=args.temperature, kl_direction=args.kl_direction,
+                           feature_weight=args.feature_weight, seed=args.seed)
+            temp = output.with_suffix(output.suffix + '.tmp')
+            torch.save(payload, temp)
+            temp.replace(output)
+            print(f'Saved best adapter: {output}', flush=True)
+        output.with_suffix('.metrics.json').write_text(json.dumps(history, indent=2) + '\n')
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--data-dir",
-        required=True,
-        help="Directory containing trajectory folders with data.json files.",
-    )
-    parser.add_argument(
-        "--config-path",
-        default="outputs/config_timeparam.yaml",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        default=(
-            "pcla_agents/wor_pretrained/nocrash_weights/"
-            "main_model_16.th"
-        ),
-    )
-    parser.add_argument(
-        "--output",
-        default="outputs/time_adapter.th",
-    )
-    parser.add_argument("--max-latency-s", type=float, default=0.25)
-    parser.add_argument("--fps", type=float, default=20.0)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--log-every", type=int, default=50)
-    parser.add_argument(
-        "--device",
-        default="cuda" if torch.cuda.is_available() else "cpu",
-    )
-
-    return parser.parse_args()
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--data-dir', required=True)
+    p.add_argument('--config-path', default='outputs/config_timeparam.yaml')
+    p.add_argument('--checkpoint', default='pcla_agents/wor_pretrained/nocrash_weights/main_model_16.th')
+    p.add_argument('--output', default='outputs/time_adapter.th')
+    p.add_argument('--delays-ms', type=float, nargs='+', default=[0, 50, 100, 150, 200])
+    p.add_argument('--max-latency-s', type=float, default=.2)
+    p.add_argument('--ego-state', choices=['none', 'speed', 'full'], default='full')
+    p.add_argument('--feature-weight', type=float, default=1.0)
+    p.add_argument('--temperature', type=float, default=1.0, help='Policy distillation temperature; not the old Q-label temperature')
+    p.add_argument('--kl-direction', choices=['student_teacher', 'teacher_student'], default='student_teacher')
+    p.add_argument('--hidden-dim', type=int, default=128)
+    p.add_argument('--correction-scale', type=float, default=.1)
+    p.add_argument('--lr', type=float, default=1e-4)
+    p.add_argument('--batch-size', type=int, default=32)
+    p.add_argument('--num-workers', type=int, default=4)
+    p.add_argument('--epochs', type=int, default=10)
+    p.add_argument('--log-every', type=int, default=50)
+    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--val-fraction', type=float, default=.2)
+    p.add_argument('--heldout-towns', nargs='*', default=[])
+    p.add_argument('--split-manifest')
+    p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    return p.parse_args(argv)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     train(parse_args())

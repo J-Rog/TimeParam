@@ -1,395 +1,191 @@
-import os
+"""Frozen WoR driving policy with optional self-distilled observation compensation."""
+import hashlib
 import math
-import yaml
-import lmdb
+import os
+from collections import deque
+
+import carla
 import numpy as np
 import torch
-import wandb
-import carla
-import random
-import string
-import cv2
-
-
-from torch.distributions.categorical import Categorical
+import yaml
 
 from leaderboard_codes.autonomous_agent1 import AutonomousAgent, Track
 from leaderboard_codes.local_planner import RoadOption
-from utils import visualize_obs
-"""
-modification
-from rails.models import (
-    EgoModel,
-    CameraModel,
-    convert_bn_to_resaware,
-    state_dict_has_resaware_stats,
-)
-"""
-from rails.models import CameraModel
-from waypointer import Waypointer
-from collections import deque
-from rails.models.time_adapter import DelayFeatureAdapter
+from pcla_agents.wor.rails.camera_io import camera_specs, crop_rgb, stitch_rgb
+from pcla_agents.wor.rails.models.main_model import CameraModel
+from pcla_agents.wor.rails.models.time_adapter import load_delay_adapter
+from pcla_agents.wor.waypointer import Waypointer
+
 
 def get_entry_point():
     return 'ImageAgent'
 
-class ImageAgent(AutonomousAgent):
-    
-    """
-    Trained image agent
-    """
-    
-    def setup(self, path_to_conf_file):
-        """
-        Setup the agent parameters
-        """
 
+class ImageAgent(AutonomousAgent):
+    def setup(self, path_to_conf_file):
         self.track = Track.SENSORS
         self.num_frames = 0
         self.latest_lane_follow = True
         self.latest_route_command = None
-
-        config_dir = os.path.dirname(os.path.abspath(path_to_conf_file))
-
-        with open(path_to_conf_file, 'r') as f:
-            config = yaml.safe_load(f)
-
-        # Loop through the items and correct the paths
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        with open(path_to_conf_file) as stream:
+            config = yaml.safe_load(stream)
+        self.config = config.copy()
         for key, value in config.items():
-            if key.endswith('_dir'):
-                # The paths in your YAML file are relative to the PCLA folder.
-                # We need to go up two directories from the config folder to get to PCLA.
-                
-                project_root = os.path.dirname(os.path.dirname(config_dir))
-                
-                # Construct the absolute path by joining the project root and the relative path from the YAML
-                absolute_path = os.path.join(project_root, value)
-                
-                # Now, set the attribute with the corrected absolute path
-                setattr(self, key, absolute_path)
-            else:
-                # For non-path values, set them as is
-                setattr(self, key, value)
-
-        self.device = torch.device('cuda')
-        self.sensor_tick = getattr(self, 'sensor_tick', 0.05)
-        #modification
-        #self.wide_scale = getattr(self, 'wide_scale', 1.0)
-        #self.narr_scale = getattr(self, 'narr_scale', 1.0)
-        '''
-        modification
+            setattr(self, key, value)
+        self.device = torch.device(config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
+        self.sensor_tick = config.get('sensor_tick', .05)
+        config['imagenet_pretrained'] = False
         self.image_model = CameraModel(config).to(self.device)
-        checkpoint_payload = torch.load(self.main_model_dir, map_location=self.device)
-        checkpoint_meta = {}
-        if isinstance(checkpoint_payload, dict) and 'state_dict' in checkpoint_payload:
-            checkpoint_state = checkpoint_payload['state_dict']
-            checkpoint_meta = {k: v for k, v in checkpoint_payload.items() if k != 'state_dict'}
-        else:
-            checkpoint_state = checkpoint_payload
-
-        needs_resaware = (
-            checkpoint_meta.get('resaware_bn')
-            or getattr(self, 'resolution_aware_bn', False)
-            or state_dict_has_resaware_stats(checkpoint_state)
-        )
-        if needs_resaware:
-            convert_bn_to_resaware(self.image_model)
-            self.image_model.load_state_dict(checkpoint_state, strict=False)
-        else:
-            self.image_model.load_state_dict(checkpoint_state)
-        self.supported_resolutions = checkpoint_meta.get('resolution_scales') or []
-        if self.supported_resolutions:
-            print(f"Loaded res-aware checkpoint supporting scales: {self.supported_resolutions}")
-        self.checkpoint_wide_scale = checkpoint_meta.get('wide_scale')
-        self.checkpoint_narr_scale = checkpoint_meta.get('narr_scale')
-        '''
-
-        self.image_model = CameraModel(config).to(self.device)
-        checkpoint_payload = torch.load(self.main_model_dir, map_location=self.device)
-        checkpoint_state = (
-            checkpoint_payload["state_dict"]
-            if isinstance(checkpoint_payload, dict) and "state_dict" in checkpoint_payload
-            else checkpoint_payload
-        )
-        self.image_model.load_state_dict(checkpoint_state)
-        self.image_model.eval()
-        
-        self.observation_latency_s = getattr(self, "observation_latency_s", 0.0)
-        self.max_observation_latency_s = getattr(self,"max_observation_latency_s",0.25,)
-
-        self.frame_history = deque(maxlen=32)
+        model_path = os.path.join(project_root, self.main_model_dir)
+        payload = torch.load(model_path, map_location=self.device, weights_only=True)
+        self.image_model.load_state_dict(payload.get('state_dict', payload), strict=True)
+        self.image_model.eval().requires_grad_(False)
         self.delay_adapter = None
-
-        if getattr(self, "time_parameterized_control", False):
-            self.delay_adapter = DelayFeatureAdapter(
-            feature_dim=512,
-            max_latency_s=self.max_observation_latency_s,
-        ).to(self.device)
-
+        if config.get('time_parameterized_control', False):
             adapter_path = os.path.join(project_root, self.time_adapter_path)
-            if os.path.isfile(adapter_path):
-                payload = torch.load(adapter_path, map_location=self.device)
-                self.delay_adapter.load_state_dict(payload["state_dict"])
-            else:
-                print(f"Time adapter checkpoint not found: {adapter_path}; using zero adapter.")
-
-            self.delay_adapter.eval()
-
-        self.vizs = []
-
+            # A missing checkpoint must not silently turn the adapter arm into a baseline.
+            payload = torch.load(adapter_path, map_location=self.device, weights_only=True)
+            self.delay_adapter = load_delay_adapter(payload, self.image_model.feature_dim, self.device)
+            if 'base_checkpoint_sha256' in payload:
+                digest = hashlib.sha256()
+                with open(model_path, 'rb') as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                        digest.update(chunk)
+                if digest.hexdigest() != payload['base_checkpoint_sha256']:
+                    raise ValueError('Adapter was trained against a different frozen WoR checkpoint')
+            trained = payload.get('model_config', {})
+            for key in ('use_narr_cam', 'all_speeds', 'num_speeds', 'min_speeds', 'max_speeds',
+                        'num_steers', 'num_throts', 'wide_crop_top', 'narr_crop_bottom', 'camera_x', 'camera_z'):
+                if key in trained and trained[key] != config[key]:
+                    raise ValueError(f'Adapter training/runtime config mismatch: {key}')
+        self.max_observation_latency_s = (self.delay_adapter.max_latency_s if self.delay_adapter else
+                                          config.get('max_observation_latency_s', .2))
+        self.frame_history = deque()
+        self.set_observation_latency(config.get('observation_latency_s', 0))
         self.waypointer = None
-
-        if self.log_wandb:
-            wandb.init(project='carla_evaluate')
-            
-        self.steers = torch.tensor(np.linspace(-self.max_steers,self.max_steers,self.num_steers)).float().to(self.device)
-        self.throts = torch.tensor(np.linspace(0,self.max_throts,self.num_throts)).float().to(self.device)
-
-        self.prev_steer = 0
+        self.steers = torch.linspace(-self.max_steers, self.max_steers, self.num_steers, device=self.device)
+        self.throts = torch.linspace(0, self.max_throts, self.num_throts, device=self.device)
         self.lane_change_counter = 0
-        self.stop_counter = 0
-        
-    def set_observation_latency(self, latency_s):
-        self.observation_latency_s = max(0.0, float(latency_s))
-
-    def destroy(self):
-        if len(self.vizs) == 0:
-            return
-
-        self.flush_data()
-        self.prev_steer = 0
-        self.lane_change_counter = 0
-        self.stop_counter = 0
         self.lane_changed = None
-        
-        del self.waypointer
-        del self.image_model
-    
-    def flush_data(self):
+        self.latest_timing = {}
 
-        if self.log_wandb:
-            wandb.log({
-                'vid': wandb.Video(np.stack(self.vizs).transpose((0,3,1,2)), fps=20, format='mp4')
-            })
-            
-        self.vizs.clear()
+    def set_observation_latency(self, latency_s):
+        latency_s = float(latency_s)
+        if not math.isfinite(latency_s) or latency_s < 0:
+            raise ValueError('Observation latency must be finite and nonnegative')
+        if self.delay_adapter is not None and latency_s > self.delay_adapter.max_latency_s + 1e-6:
+            raise ValueError('Requested delay exceeds adapter training range')
+        self.observation_latency_s = latency_s
 
     def sensors(self):
-        sensors = [ # Sensors modified to match online leaderboard based on https://github.com/dotchen/WorldOnRails/issues/27
-            {'type': 'sensor.speedometer', 'id': 'EGO'},
-            {'type': 'sensor.other.gnss', 'x': 0., 'y': 0.0, 'z': self.camera_z, 'sensor_tick': self.sensor_tick or 0.0, 'id': 'GPS'},
-            {'type': 'sensor.camera.rgb', 'x': self.camera_x, 'y': 0, 'z': self.camera_z, 'roll': 0.0, 'pitch': 0.0, 'yaw': -55.0,
-            'width': 160, 'height': 240, 'fov': 60, 'sensor_tick': self.sensor_tick, 'id': f'Wide_RGB_0'},
-            {'type': 'sensor.camera.rgb', 'x': self.camera_x, 'y': 0, 'z': self.camera_z, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
-            'width': 160, 'height': 240, 'fov': 60, 'sensor_tick': self.sensor_tick, 'id': f'Wide_RGB_1'},
-            {'type': 'sensor.camera.rgb', 'x': self.camera_x, 'y': 0, 'z': self.camera_z, 'roll': 0.0, 'pitch': 0.0, 'yaw':  55.0,
-            'width': 160, 'height': 240, 'fov': 60, 'sensor_tick': self.sensor_tick, 'id': f'Wide_RGB_2'},
-            {'type': 'sensor.camera.rgb', 'x': self.camera_x, 'y': 0, 'z': self.camera_z, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
-            'width': 384, 'height': 240, 'fov': 50, 'sensor_tick': self.sensor_tick, 'id': f'Narrow_RGB'},
-        ]
-        return sensors
+        return [dict(type='sensor.speedometer', id='EGO'),
+                dict(type='sensor.other.gnss', x=0., y=0., z=self.camera_z,
+                     sensor_tick=self.sensor_tick, id='GPS')] + camera_specs(self.config, self.sensor_tick)
 
-    def run_step(self, input_data, timestamp, vehicle=None):
-
-        # 1. Collect the current raw camera packet.
-        wide_packets = []
-        wide_frame_ids = []
-
-        for i in range(3):
-            frame_id, wide_rgb = input_data.get(f"Wide_RGB_{i}")
-            wide_frame_ids.append(frame_id)
-            wide_packets.append(wide_rgb.copy())
-
-        narr_frame_id, narr_rgb = input_data.get("Narrow_RGB")
-
-        # 2. Record it in the visual-observation history.
-        self.frame_history.append({
-            "timestamp": timestamp,
-            "wide_rgbs": wide_packets,
-            "narr_rgb": narr_rgb.copy(),
-            "frame_ids": wide_frame_ids,
-            "narr_frame_id": narr_frame_id,
-        })
-
-        # 3. Select the newest packet available at or before T - latency.
-        target_time = timestamp - self.observation_latency_s
+    @torch.no_grad()
+    def run_step(self, input_data, timestamp, vehicle=None, camera_timestamp_s=None,
+                 received_monotonic_s=None):
+        frames = [input_data[f'Wide_RGB_{i}'][0] for i in range(3)] + [input_data['Narrow_RGB'][0]]
+        if len(set(frames)) != 1:
+            raise ValueError('WoR requires frame-aligned wide/narrow cameras')
+        if camera_timestamp_s is None:
+            # PCLA's timestamp may have an episode-local origin. Use the frame age
+            # relative to its current snapshot, not an absolute CARLA epoch.
+            if vehicle is None:
+                raise ValueError('Need vehicle or explicit camera timestamp for delay measurement')
+            snapshot = vehicle.get_world().get_snapshot()
+            camera_timestamp_s = timestamp - (snapshot.frame - frames[0]) * snapshot.timestamp.delta_seconds
+        if not math.isfinite(camera_timestamp_s) or camera_timestamp_s > timestamp + 1e-6:
+            raise ValueError('Camera capture timestamp must not be in the future')
+        if self.frame_history and frames[0] < self.frame_history[-1]['frame']:
+            raise ValueError('Camera frames must arrive in chronological order')
+        if not self.frame_history or frames[0] != self.frame_history[-1]['frame']:
+            wide, narrow = stitch_rgb([input_data[f'Wide_RGB_{i}'][1] for i in range(3)], input_data['Narrow_RGB'][1])
+            self.frame_history.append(dict(timestamp=camera_timestamp_s, frame=frames[0],
+                wide=wide, narrow=narrow, received_monotonic_s=received_monotonic_s))
+        target = timestamp - self.observation_latency_s
         selected = self.frame_history[0]
-
         for packet in reversed(self.frame_history):
-            if packet["timestamp"] <= target_time:
+            if packet['timestamp'] <= target + 1e-6:
                 selected = packet
                 break
-
-        actual_latency_s = max(0.0, timestamp - selected["timestamp"])
-
-        # 4. Preprocess the selected, potentially stale RGB images.
-        wide_rgbs = []
-        for wide_rgb in selected["wide_rgbs"]:
-            wide_rgb_crop = wide_rgb[self.wide_crop_top:, :, :3]
-            _wide_rgb = wide_rgb_crop[..., ::-1].copy()  # CARLA BGR -> RGB
-            wide_rgbs.append(_wide_rgb)
-
-        wide_rgbs_con = np.concatenate(
-            [wide_rgbs[0], wide_rgbs[1], wide_rgbs[2]],
-            axis=1,
-        )
-        wide_rgbs_ = (
-            torch.tensor(wide_rgbs_con[None])
-            .float()
-            .permute(0, 3, 1, 2)
-            .to(self.device)
-        )
-
-        narr_rgb = selected["narr_rgb"]
-        narr_rgb_crop = narr_rgb[:-self.narr_crop_bottom, :, :3]
-        _narr_rgb = narr_rgb_crop[..., ::-1].copy()
-
-        # Crop images
-        #_wide_rgb = wide_rgb[self.wide_crop_top:,:,:3]
-        #_narr_rgb = narr_rgb[:-self.narr_crop_bottom,:,:3]
-
-        #wide_rgb = _wide_rgb[...,::-1].copy()
-        #_narr_rgb = _narr_rgb[...,::-1].copy()
-
-        _, ego = input_data.get('EGO')
-        _, gps = input_data.get('GPS')
-
-
+        age = max(0., timestamp - selected['timestamp'])
+        warmup = selected['timestamp'] > target + 1e-6
+        if self.delay_adapter is not None and age > self.delay_adapter.max_latency_s + 1e-6:
+            raise ValueError('Measured observation age exceeds adapter training range')
+        # Retain one packet before the entire supported delay window.
+        keep_after = timestamp - max(self.max_observation_latency_s, self.observation_latency_s) - self.sensor_tick
+        while len(self.frame_history) > 1 and self.frame_history[1]['timestamp'] < keep_after:
+            self.frame_history.popleft()
+        wide, narrow = crop_rgb(selected['wide'], selected['narrow'], self.config)
+        wide = torch.as_tensor(wide, device=self.device).permute(2, 0, 1)[None].float()
+        narrow = torch.as_tensor(narrow, device=self.device).permute(2, 0, 1)[None].float()
+        _, ego = input_data['EGO']
+        _, gps = input_data['GPS']
         if self.waypointer is None:
             self.waypointer = Waypointer(self._global_plan, gps)
-
         _, _, cmd = self.waypointer.tick(gps)
         self.latest_route_command = cmd
-        self.latest_lane_follow = (cmd == RoadOption.LANEFOLLOW)
-
-        spd = ego.get('speed')
-        
-        cmd_value = cmd.value-1
-        cmd_value = 3 if cmd_value < 0 else cmd_value
-
-        if cmd_value in [4,5]:
+        self.latest_lane_follow = cmd == RoadOption.LANEFOLLOW
+        spd = float(ego['speed'])
+        cmd_value = max(0, cmd.value - 1) if cmd.value > 0 else 3
+        if cmd_value in (4, 5):
             if self.lane_changed is not None and cmd_value != self.lane_changed:
                 self.lane_change_counter = 0
-
             self.lane_change_counter += 1
-            self.lane_changed = cmd_value if self.lane_change_counter > {4:200,5:200}.get(cmd_value) else None
+            self.lane_changed = cmd_value if self.lane_change_counter > 200 else None
         else:
-            self.lane_change_counter = 0
-            self.lane_changed = None
-
+            self.lane_change_counter, self.lane_changed = 0, None
         if cmd_value == self.lane_changed:
             cmd_value = 3
-
-        _wide_rgb = torch.tensor(_wide_rgb[None]).float().permute(0,3,1,2).to(self.device)
-        _narr_rgb = torch.tensor(_narr_rgb[None]).float().permute(0,3,1,2).to(self.device)
-        
-        latency_tensor = torch.tensor(
-            [actual_latency_s],
-            dtype=torch.float32,
-            device=self.device,
-        )
-        
-        
+        ego_state = None
+        if self.delay_adapter is not None and self.delay_adapter.ego_dim:
+            state = [spd]
+            if self.delay_adapter.ego_dim == 5:
+                if vehicle is None:
+                    raise ValueError('Full-state adapter requires live vehicle telemetry')
+                control = vehicle.get_control()
+                state += [math.radians(vehicle.get_angular_velocity().z), control.steer, control.throttle, control.brake]
+            ego_state = torch.tensor([state], dtype=torch.float32, device=self.device)
+        steer, throttle, brake = self.image_model.policy(wide, narrow, cmd_value,
+            spd=torch.tensor([spd], device=self.device) if not self.all_speeds else None,
+            delay_adapter=self.delay_adapter, latency_s=torch.tensor([age], device=self.device), ego_state=ego_state)
         if self.all_speeds:
-            #steer_logits, throt_logits, brake_logits = self.image_model.policy(wide_rgbs_, _narr_rgb, cmd_value)
-            #steer_logits, throt_logits, brake_logits = self.image_model.policy(_wide_rgb, _narr_rgb, cmd_value)
-            steer_logits, throt_logits, brake_logits = self.image_model.policy( wide_rgbs_,_narr_rgb,cmd_value,delay_adapter=self.delay_adapter,latency_s=latency_tensor,)
-            # Interpolate logits
-            steer_logit = self._lerp(steer_logits, spd)
-            throt_logit = self._lerp(throt_logits, spd)
-            brake_logit = self._lerp(brake_logits, spd)
-        else:
-            #steer_logit, throt_logit, brake_logit = self.image_model.policy(_wide_rgb, _narr_rgb, cmd_value, spd=torch.tensor([spd]).float().to(self.device))
-            steer_logit, throt_logit, brake_logit = self.image_model.policy(_wide_rgb,_narr_rgb,cmd_value,spd=torch.tensor([spd]).float().to(self.device),delay_adapter=self.delay_adapter,latency_s=latency_tensor,)
-
-        
-        action_prob = self.action_prob(steer_logit, throt_logit, brake_logit)
-
-        brake_prob = float(action_prob[-1])
-
-        steer = float(self.steers @ torch.softmax(steer_logit, dim=0))
-        throt = float(self.throts @ torch.softmax(throt_logit, dim=0))
-
-        steer, throt, brake = self.post_process(steer, throt, brake_prob, spd, cmd_value)
-
-        
-        #rgb = np.concatenate([wide_rgb, narr_rgb[...,:3]], axis=1)
-        
-        #self.vizs.append(visualize_obs(rgb, 0, (steer, throt, brake), spd, cmd=cmd_value+1))
-
-        if len(self.vizs) > 1000:
-            self.flush_data()
-
+            steer, throttle, brake = [self._lerp(v, spd) for v in (steer, throttle, brake)]
+        brake_prob = float(self.action_prob(steer, throttle, brake)[-1])
+        steer = float(self.steers @ torch.softmax(steer, dim=0))
+        throttle = float(self.throts @ torch.softmax(throttle, dim=0))
+        steer, throttle, brake = self.post_process(steer, throttle, brake_prob, spd, cmd_value)
+        self.latest_timing = dict(camera_frame=selected['frame'], camera_timestamp_s=selected['timestamp'],
+            received_monotonic_s=selected['received_monotonic_s'], observation_age_sim_s=age, warmup=warmup)
         self.num_frames += 1
+        return carla.VehicleControl(steer=steer, throttle=throttle, brake=brake)
 
-        return carla.VehicleControl(steer=steer, throttle=throt, brake=brake)
-    
-    def _lerp(self, v, x):
-        D = v.shape[0]
-
-        min_val = self.min_speeds
-        max_val = self.max_speeds
-
-        x = (x - min_val)/(max_val - min_val)*(D-1)
-
-        x0, x1 = max(min(math.floor(x), D-1),0), max(min(math.ceil(x), D-1),0)
-        w = x - x0
-
-        return (1-w) * v[x0] + w * v[x1]
+    def _lerp(self, values, speed):
+        position = np.clip((speed - self.min_speeds) / (self.max_speeds - self.min_speeds), 0, 1) * (values.shape[0] - 1)
+        lower, upper = math.floor(position), math.ceil(position)
+        weight = position - lower
+        return (1 - weight) * values[lower] + weight * values[upper]
 
     def action_prob(self, steer_logit, throt_logit, brake_logit):
-
-        steer_logit = steer_logit.repeat(self.num_throts)
-        throt_logit = throt_logit.repeat_interleave(self.num_steers)
-
-        action_logit = torch.cat([steer_logit, throt_logit, brake_logit[None]])
-
-        return torch.softmax(action_logit, dim=0)
+        # Preserve the existing deployed driver, including its legacy layout.
+        # Self-distillation uses CameraModel.driving_logits_from_features to match.
+        steer = steer_logit.repeat(self.num_throts)
+        throttle = throt_logit.repeat_interleave(self.num_steers)
+        return torch.softmax(torch.cat([steer, throttle, brake_logit[None]]), dim=0)
 
     def post_process(self, steer, throt, brake_prob, spd, cmd):
-        
         if brake_prob > 0.5:
             steer, throt, brake = 0, 0, 1
         else:
-            brake = 0
-            throt = max(0.4, throt)
-
-        # # To compensate for non-linearity of throttle<->acceleration
-        # if throt > 0.1 and throt < 0.4:
-        #     throt = 0.4
-        # elif throt < 0.1 and brake_prob > 0.3:
-        #     brake = 1
-
-        if spd > {0:10,1:10}.get(cmd, 20)/3.6: # 10 km/h for turning, 15km/h elsewhere
+            brake, throt = 0, max(0.4, throt)
+        if spd > {0: 10, 1: 10}.get(cmd, 20) / 3.6:
             throt = 0
-
-        # if cmd == 2:
-        #     steer = min(max(steer, -0.2), 0.2)
-
-        # if cmd in [4,5]:
-        #     steer = min(max(steer, -0.4), 0.4) # no crazy steerings when lane changing
-
         return steer, throt, brake
-"""
-Modification
-    def _resize_rgb(self, rgb, scale):
-        if scale is None or abs(scale - 1.0) < 1e-6:
-            return rgb
-        h, w = rgb.shape[:2]
-        new_size = (
-            max(1, int(round(w * scale))),
-            max(1, int(round(h * scale))),
-        )
-        return cv2.resize(rgb, new_size, interpolation=cv2.INTER_AREA)
-"""
-def load_state_dict(model, path):
 
-    from collections import OrderedDict
-    new_state_dict = OrderedDict()
-    state_dict = torch.load(path)
-    
-    for k, v in state_dict.items():
-        name = k[7:] # remove `module.`
-        new_state_dict[name] = v
-    
-    model.load_state_dict(new_state_dict)
+    def destroy(self):
+        self.frame_history.clear()
+        self.waypointer = None
+        self.delay_adapter = None
+        self.image_model = None

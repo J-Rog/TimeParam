@@ -192,3 +192,8 @@ If you use this repository, please cite:
 
 - This paper: *Multi-Resolution End-to-End Deep Neural Network for Optimizing Latency-Accuracy Tradeoff in Autonomous Driving*
 - PCLA (FSE 2025): https://dl.acm.org/doi/abs/10.1145/3696630.3728577
+
+## Self-distilled observation-delay compensation
+
+Train the WoR time adapter from your own CARLA trajectories without the unavailable
+WoR Q-value labels. See [the collection, training and closed-loop evaluation guide](docs/SELF_DISTILLATION.md).
